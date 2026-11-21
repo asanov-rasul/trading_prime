@@ -1,0 +1,37 @@
+{
+ "ts": 1795254564842,
+ "time": "2026-11-21T09:49:24.842Z",
+ "version": "1.5.0",
+ "telegram": "setup",
+ "profile": "soft",
+ "presets": [
+  "main",
+  "swing"
+ ],
+ "expiryBars": 96,
+ "minScore": 60,
+ "source": {
+  "id": "binanceSpot",
+  "name": "Binance Spot",
+  "market": "spot",
+  "host": "data-api.binance.vision"
+ },
+ "sourceFails": [
+  "Binance Futures · fapi.binance.com: HTTP 451: {\n  \"code\": 0,\n  \"msg\": \"Service unavailable from a restricted location according to 'b. Eligibility' in https://www.bin…",
+  "Binance Spot · api.binance.com: HTTP 451: {\n  \"code\": 0,\n  \"msg\": \"Service unavailable from a restricted location according to 'b. Eligibility' in https://www.bin…"
+ ],
+ "coins": {
+  "want": 29,
+  "loaded": 29,
+  "skipped": []
+ },
+ "signals": {
+  "open": 0,
+  "new": 0,
+  "events": 0,
+  "messages": 0
+ },
+ "errors": [],
+ "requests": 120,
+ "durationMs": 9851
+}
