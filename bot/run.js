@@ -9,6 +9,8 @@
 
    Секреты — только из переменных окружения: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID. Токен и chat id не
    выводятся в лог и не пишутся в состояние (ветка bot-state публичная). Без npm-зависимостей, Node 20+.
+   Личные настройки (необязательно): BOT_TZ — часовой пояс сообщений, BOT_DEPOSIT / BOT_RISK_PCT / BOT_LEVERAGE —
+   размер позиции по калькулятору приложения. Их значения тоже не попадают ни в лог, ни в состояние.
 
    Ключи: --state DIR (папка состояния), --source ID (binanceFutures | binanceSpot | bybit), --lookback N
    (свечей младшего ТФ для детектора), --block host1,host2 (имитация блокировки 451, как у раннеров в США),
@@ -49,8 +51,29 @@ const FAKE = process.env.BOT_FAKE_TELEGRAM === '1' || DEMO;
 const MODE = FAKE ? 'fake' : (ARGS.dry || !TOKEN) ? 'off' : (!CHAT_ID ? 'setup' : 'on');
 const CAN_SEND = MODE === 'on' || MODE === 'fake';
 
+// Личные настройки (секреты или переменные репозитория). Значения не выводятся в лог и не пишутся в состояние.
+function envNum(name, lo, hi) {
+  const raw = String(process.env[name] || '').trim().replace(',', '.');
+  if (!raw) return { value: null, bad: false };
+  const v = Number(raw);
+  return (isFinite(v) && v >= lo && v <= hi) ? { value: v, bad: false } : { value: null, bad: true };
+}
+function envTZ(name) {
+  const raw = String(process.env[name] || '').trim();
+  if (!raw) return { tz: 'UTC', bad: false };
+  try { new Intl.DateTimeFormat('ru-RU', { timeZone: raw }).format(0); return { tz: raw, bad: false }; } catch (e) { return { tz: 'UTC', bad: true }; }
+}
+const ENV_DEP = envNum('BOT_DEPOSIT', 1, 1e9), ENV_RISK = envNum('BOT_RISK_PCT', 0.01, 20), ENV_LEV = envNum('BOT_LEVERAGE', 1, 125);
+const ENV_TZ = envTZ('BOT_TZ');
+const SETTINGS_NOTES = [];
+if (ENV_DEP.bad) SETTINGS_NOTES.push('BOT_DEPOSIT задан неверно (нужно число больше 0) — размер позиции не показываю');
+if (ENV_RISK.bad) SETTINGS_NOTES.push('BOT_RISK_PCT задан неверно (от 0.01 до 20) — беру риск по умолчанию');
+if (ENV_LEV.bad) SETTINGS_NOTES.push('BOT_LEVERAGE задан неверно (от 1 до 125) — беру плечо по умолчанию');
+if (ENV_TZ.bad) SETTINGS_NOTES.push('BOT_TZ задан неверно (нужно имя пояса, например Europe/Moscow) — время в UTC');
+
 const CHECK_EVERY_MIN = 10;          // как в расписании workflow
 const DETECT_WINDOW_MS = 4 * 3600000; // детектор: последние ~4 ч закрытых свечей младшего ТФ
+const OUTAGE_NOTIFY_MS = 60 * 60000; // о сбое данных сообщить, если он длится час и больше
 const KEEP_CLOSED_DAYS = 365;        // закрытые сигналы для недельных сводок
 const KEEP_SEEN_DAYS = 3;            // найденные, но не показанные (для защиты от дублей)
 const STATE_V = 1;
@@ -97,18 +120,24 @@ function loadApp() {
   sandbox.window = sandbox;
   sandbox.self = sandbox;
   vm.createContext(sandbox);
-  ['config.js', 'data.js', 'smc.js', 'signals.js'].forEach(f => {
+  ['config.js', 'data.js', 'smc.js', 'signals.js', 'calc.js'].forEach(f => {
     const file = path.join(ROOT, 'js', f);
     vm.runInContext(fs.readFileSync(file, 'utf8'), sandbox, { filename: file });
   });
   return sandbox;
 }
 const APP = loadApp();
-const C = APP.CONFIG, SMC = APP.SMC, Data = APP.Data, Signals = APP.Signals;
+const C = APP.CONFIG, SMC = APP.SMC, Data = APP.Data, Signals = APP.Signals, Calc = APP.Calc;
 const configFor = APP.configFor, profileFor = APP.profileFor;
 const Q = C.qualityPreset;
 const PRESETS = (Q.presets || []).filter(p => C.presets[p]);
 const BTC_SYM = C.btcCoin + C.quote;
+// «Стоп-кран»: пороги из CONFIG.guard (заданы заранее).
+const G = Object.assign({ lossStreak: 5, windowDays: 30, lossR: 5 }, C.guard || {});
+// Размер позиции: только если задан депозит. Риск и плечо — из настроек или по умолчанию калькулятора.
+let SIZE = ENV_DEP.value ? {
+  deposit: ENV_DEP.value, riskPct: ENV_RISK.value || C.calculator.riskPct, leverage: ENV_LEV.value || C.calculator.leverage
+} : null;
 
 // =====================================================================================
 // ФОРМАТИРОВАНИЕ
@@ -125,11 +154,30 @@ function decOf(p) {
 }
 function fP(p) { return isNum(p) ? p.toFixed(decOf(p)) : '—'; }
 function pad(n) { return String(n).padStart(2, '0'); }
+// Время для лога — всегда UTC: лог публичный, пояс пользователя в нём не показывается.
 function fUTC(t) {
   if (!isNum(t)) return '—';
   const d = new Date(t);
   return pad(d.getUTCDate()) + '.' + pad(d.getUTCMonth() + 1) + ' ' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ' UTC';
 }
+// Время для сообщений — в поясе пользователя (BOT_TZ) с подписью смещения, например «21.11 14:30 UTC+3».
+const TZ_PARTS = new Intl.DateTimeFormat('ru-RU', { timeZone: ENV_TZ.tz, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+let TZ_OFFSET = null;
+try { TZ_OFFSET = new Intl.DateTimeFormat('en-US', { timeZone: ENV_TZ.tz, timeZoneName: 'shortOffset' }); } catch (e) { TZ_OFFSET = null; }
+function tzLabel(t) {
+  if (ENV_TZ.tz === 'UTC') return 'UTC';
+  if (!TZ_OFFSET) return ENV_TZ.tz;
+  const p = TZ_OFFSET.formatToParts(t).find(x => x.type === 'timeZoneName');
+  return p ? p.value.replace(/^GMT/, 'UTC') : ENV_TZ.tz;
+}
+function fT(t) {
+  if (!isNum(t)) return '—';
+  const parts = TZ_PARTS.formatToParts(t), g = k => (parts.find(x => x.type === k) || {}).value || '';
+  return g('day') + '.' + g('month') + ' ' + g('hour') + ':' + g('minute') + ' ' + tzLabel(t);
+}
+function fQty(q) { return isNum(q) ? q.toFixed(q >= 100 ? 2 : (q >= 1 ? 4 : 6)) : '—'; }
+function fUsd(x) { return isNum(x) ? x.toFixed(2) : '—'; }
+function fNum(x) { return isNum(x) ? String(Math.round(x * 100) / 100) : '—'; }
 function fDay(t) { const d = new Date(t); return pad(d.getUTCDate()) + '.' + pad(d.getUTCMonth() + 1); }
 function fR(r) { return isNum(r) ? (r > 0 ? '+' : '') + r.toFixed(2) + 'R' : '—'; }
 // Длительность: минуты, часы, а от 48 ч ровными сутками — дни (как hoursText в приложении).
@@ -164,53 +212,112 @@ function pct(f) { return Math.round(f * 100) + '%'; }
 // =====================================================================================
 // СООБЩЕНИЯ
 // =====================================================================================
+// Пометка об источнике — только если бот взял не тот источник, что приложение по умолчанию (CONFIG.qualityPreset.source).
 function sourceNote(src) {
-  if (!src || src.id === 'binanceFutures') return '';
-  if (src.id === 'binanceSpot') return 'Данные: Binance Spot' + (src.host === 'data-api.binance.vision' ? ' (зеркало)' : '') +
-    ' — фьючерсы Binance с сервера бота недоступны, уровни могут немного отличаться от приложения.';
-  return 'Данные: ' + src.name + ' — уровни могут немного отличаться от приложения (Binance Futures).';
+  if (!src) return '';
+  const want = Q.source && Data.ADAPTERS[Q.source] ? Q.source : 'binanceFutures';
+  if (src.id === want) return '';
+  return 'Данные: ' + src.name + ' — запасной источник (в приложении по умолчанию ' + Data.ADAPTERS[want].name + '), уровни могут немного отличаться.';
 }
-function msgNewSignal(sig, src, nowT) {
+// Ссылка на сигнал в приложении: откроется карточка сигнала с графиком (или график монеты, если сигнала там нет).
+function sigLink(sig) {
+  const url = pagesUrl();
+  return url ? '📈 <a href="' + esc(url + '#sig=' + encodeURIComponent(sig.id)) + '">График в приложении</a>' : '';
+}
+// Сопровождение сделки — из CONFIG.tp (доли закрытия и перенос стопа после TP1/TP2).
+function moveName(mv) { return mv === 'be' ? 'стоп в безубыток' : (mv === 'tp1' ? 'стоп на TP1' : 'стоп не двигать'); }
+function managementText() {
+  const fr = C.tp.fractions, mv = C.tp.moveStop;
+  return 'TP1 — закрыть ' + pct(fr[0]) + ', ' + moveName(mv[0]) + '; TP2 — ещё ' + pct(fr[1]) + ', ' + moveName(mv[1]) + '; TP3 — остаток ' + pct(fr[2]);
+}
+// Размер позиции — калькулятором приложения (Calc.compute): риск от депозита, фьючерсная комиссия, проскальзывание, доли TP.
+function sizeCalc(sig, size) {
+  if (!size) return null;
+  return Calc.compute({
+    deposit: size.deposit, riskPct: size.riskPct, dir: sig.dir, entry: sig.entry, sl: sig.sl, tp: [sig.tp1, sig.tp2, sig.tp3],
+    fr: C.tp.fractions.map(x => x * 100), leverage: size.leverage, feePct: C.fees.futures, slipPct: C.slippagePct,
+    minOrder: C.calculator.minOrder, mode: 'risk', mmrPct: C.calculator.mmrPct
+  });
+}
+function sizeLines(sig, size) {
+  if (!size) return [];
+  const r = sizeCalc(sig, size);
+  if (!r || !r.ok) return ['💼 Размер позиции не посчитан: ' + esc(((r && r.warnings) || []).map(w => w.text).join('; ') || 'ошибка расчёта') + '.'];
+  const out = [
+    '💼 Позиция (депозит ' + fNum(size.deposit) + ' USDT, риск ' + fNum(size.riskPct) + '%, плечо ' + fNum(size.leverage) + 'x): <code>' + fQty(r.qty) + '</code> ' + esc(sig.coin) + ' ≈ ' + fUsd(r.notional) + ' USDT',
+    'Маржа ≈ ' + fUsd(r.margin) + ' USDT · убыток на SL ≈ ' + fUsd(Math.abs(r.scenarios.sl.usd)) + ' USDT (с комиссией и проскальзыванием)'
+  ];
+  r.warnings.filter(w => !/TP/.test(w.text)).forEach(w => out.push('⚠️ ' + esc(w.text)));
+  return out;
+}
+// Сколько монет закрыть на TP(k+1) при заданном депозите.
+function partQty(sig, k) {
+  const r = sizeCalc(sig, SIZE);
+  return (r && r.ok) ? ' (<code>' + fQty(r.qty * C.tp.fractions[k]) + '</code> ' + esc(sig.coin) + ')' : '';
+}
+function msgNewSignal(sig, src, nowT, size) {
+  if (size === undefined) size = SIZE;
   const long = sig.dir === 1;
   const lines = [];
   lines.push((long ? '🟢' : '🔴') + ' <b>' + esc(sig.side + ' ' + sig.coin) + '</b> · ' + esc(presetName(sig.preset)));
   lines.push('Профиль: ' + esc(modeShort(sig.mode)) + ' · score ' + sig.score);
-  lines.push('Лимитный вход: <b>' + fP(sig.entry) + '</b>');
+  lines.push('Лимитный вход: <code>' + fP(sig.entry) + '</code>');
   const risk = isNum(sig.riskPct) ? sig.riskPct : sig.R / sig.entry * 100;
-  lines.push('SL: ' + fP(sig.sl) + ' (риск ' + risk.toFixed(2) + '%)');
-  lines.push('TP1: ' + fP(sig.tp1) + ' · TP2: ' + fP(sig.tp2) + ' · TP3: ' + fP(sig.tp3) + (isNum(sig.tp3R) ? ' (' + sig.tp3R.toFixed(1) + 'R)' : ''));
-  lines.push('Ждём вход ' + fHours(sig.expiryBars * sig.ltfMs) + ' — до ' + fUTC(sig.expiresT));
-  lines.push('Сигнал по свече, закрывшейся ' + fUTC(sig.createdT));
+  lines.push('SL: <code>' + fP(sig.sl) + '</code> (риск ' + risk.toFixed(2) + '%)');
+  lines.push('TP1: <code>' + fP(sig.tp1) + '</code> · TP2: <code>' + fP(sig.tp2) + '</code> · TP3: <code>' + fP(sig.tp3) + '</code>' + (isNum(sig.tp3R) ? ' (' + sig.tp3R.toFixed(1) + 'R)' : ''));
+  lines.push('Сопровождение: ' + esc(managementText()));
+  sizeLines(sig, size).forEach(l => lines.push(l));
+  lines.push('Ждём вход ' + fHours(sig.expiryBars * sig.ltfMs) + ' — до ' + fT(sig.expiresT));
+  lines.push('Сигнал по свече, закрывшейся ' + fT(sig.createdT));
   const lag = nowT - sig.createdT;
   if (lag > 20 * 60000) lines.push('⚠️ Найден с опозданием: ' + fHours(lag) + ' после закрытия свечи' + (lag < 2 * 3600000 ? ' (GitHub задержал запуск).' : '.'));
   if (sig.status === 'active') {
-    lines.push('⚠️ Цена уже дошла до входа: сделка по сигналу идёт со свечи ' + fUTC(sig.filledT) + '.' +
-      (sig.tpHit[0] ? ' TP1 уже взят, стоп в безубытке.' : ''));
+    lines.push('⚠️ Цена уже дошла до входа: сделка по сигналу идёт со свечи ' + fT(sig.filledT) + '.' +
+      (sig.tpHit[0] ? ' TP1 уже взят, ' + moveName(C.tp.moveStop[0]).replace('стоп в безубыток', 'стоп в безубытке').replace('стоп не двигать', 'стоп на месте') + '.' : ''));
   }
   const note = sourceNote(src);
   if (note) lines.push(note);
-  const url = pagesUrl();
-  if (url) lines.push('Приложение: ' + url);
+  const link = sigLink(sig);
+  if (link) lines.push(link);
   return lines.join('\n');
 }
+// Стоп после TP(k+1) по текущему сопровождению: от SL с переносами moveStop[0..k]. Не берём sig.stop: в одном
+// сообщении могут быть и TP1, и TP2, а sig.stop к моменту отправки уже сдвинут после TP2.
+function stopAfterTp(k, sig) {
+  let stop = sig.sl;
+  for (let i = 0; i <= k; i++) {
+    const mv = C.tp.moveStop[i];
+    if (mv === 'be') stop = Signals.bePrice(sig);
+    else if (mv === 'tp1') stop = sig.tp1;
+  }
+  return stop;
+}
 function tpMoveText(k, sig) {
-  const mv = C.tp.moveStop[k];
-  if (mv === 'be') return 'стоп в безубыток ' + fP(Signals.bePrice(sig));
-  if (mv === 'tp1') return 'стоп на TP1 ' + fP(sig.tp1);
-  return 'стоп без изменений';
+  const mv = C.tp.moveStop[k], stop = stopAfterTp(k, sig);
+  if (mv === 'be') return 'стоп в безубыток (<code>' + fP(stop) + '</code>)';
+  if (mv === 'tp1') return 'стоп на TP1 (<code>' + fP(stop) + '</code>)';
+  return 'стоп не двигаем (' + (stop === sig.sl ? 'SL ' : '') + '<code>' + fP(stop) + '</code>)';
+}
+// Сообщение о событиях по сигналу (или null, если событий нет) — со ссылкой на график.
+function eventMessage(sig, sent) {
+  const lines = eventLines(sig, sent);
+  if (!lines.length) return null;
+  const link = sigLink(sig);
+  return (link ? lines.concat(link) : lines).join('\n');
 }
 // События по сигналу с прошлой отправки: вход, TP1, TP2, закрытие или отмена — одним сообщением.
 function eventLines(sig, sent) {
   const head = esc(sig.coin + ' ' + sig.side), out = [];
   const fr = C.tp.fractions;
   if (sent.status === 'pending' && sig.filledT !== null && sig.filledT !== undefined) {
-    out.push('✅ ' + head + ': вход исполнен по ' + fP(sig.entry) + ' (свеча ' + fUTC(sig.filledT) + '). Стоп ' + fP(sig.sl) + '.');
+    out.push('✅ ' + head + ': вход исполнен по <code>' + fP(sig.entry) + '</code> (свеча ' + fT(sig.filledT) + '). Стоп <code>' + fP(sig.sl) + '</code>.');
   }
-  if (sig.tpHit[0] && !sent.tp[0]) out.push('🎯 ' + head + ': TP1 ' + fP(sig.tp1) + ' взят — закрыть ' + pct(fr[0]) + ', ' + tpMoveText(0, sig) + '.');
-  if (sig.tpHit[1] && !sent.tp[1]) out.push('🎯 ' + head + ': TP2 ' + fP(sig.tp2) + ' взят — закрыть ещё ' + pct(fr[1]) + ', ' + tpMoveText(1, sig) + '.');
+  if (sig.tpHit[0] && !sent.tp[0]) out.push('🎯 ' + head + ': TP1 <code>' + fP(sig.tp1) + '</code> взят — закрыть ' + pct(fr[0]) + partQty(sig, 0) + ', ' + tpMoveText(0, sig) + '.');
+  if (sig.tpHit[1] && !sent.tp[1]) out.push('🎯 ' + head + ': TP2 <code>' + fP(sig.tp2) + '</code> взят — закрыть ещё ' + pct(fr[1]) + partQty(sig, 1) + ', ' + tpMoveText(1, sig) + '.');
   if (!Signals.isOpen(sig) && (sent.status === 'pending' || sent.status === 'active')) {
     if (sig.status === 'closed') {
-      const icon = sig.resultR > 0 ? '🏁' : '🛑';
+      // Значок — по знаку итога: сделка, дошедшая до TP1, может закрыться и в минус (TP1 → стоп по SL).
+      const icon = sig.resultR > 0 ? '🏁' : (sig.resultR < 0 ? '🛑' : '➖');
       out.push(icon + ' ' + head + ' закрыт: ' + esc(Signals.statusText(sig)) + '. Итог ' + fR(sig.resultR) + '.');
     } else if (sig.status === 'expired' && sig.outcome === 'expired') {
       out.push('⌛ ' + head + ': вход не случился за ' + fHours(sig.expiryBars * sig.ltfMs) + ' — отмените лимитный ордер.');
@@ -226,20 +333,51 @@ function msgWelcome(info) {
   lines.push('Монет: ' + info.coins + (info.skipped ? ' (без данных: ' + info.skipped + ')' : '') + ' · пресеты: ' + PRESETS.map(p => esc(presetName(p))).join(', '));
   lines.push('Профиль: ' + esc(modeShort(Q.strategy)) + ' · minScore ' + Q.minScore);
   lines.push('Ожидание входа ' + Q.expiryBars + ' ' + plural(Q.expiryBars, 'свеча', 'свечи', 'свечей') + ' младшего ТФ: ' + esc(waitByPreset()));
+  lines.push('Сопровождение: ' + esc(managementText()) + '.');
   lines.push('Проверка рынка — примерно раз в ' + CHECK_EVERY_MIN + ' минут (GitHub может задерживать запуски).');
   lines.push('Пришлю: новый сигнал, вход, TP1/TP2, закрытие или отмену; по понедельникам — итоги недели.');
+  lines.push('Цены в сообщениях копируются одним касанием. Время — ' + tzLabel(Date.now()) + (ENV_TZ.tz === 'UTC' ? ' (свой пояс — настройка BOT_TZ).' : '.'));
+  lines.push(SIZE
+    ? 'Размер позиции считаю по депозиту ' + fNum(SIZE.deposit) + ' USDT, риску ' + fNum(SIZE.riskPct) + '% и плечу ' + fNum(SIZE.leverage) + 'x.'
+    : 'Размер позиции не показываю: не задан депозит (настройка BOT_DEPOSIT).');
+  lines.push('Стоп-кран: предупрежу, если ' + G.lossStreak + ' сделок подряд закроются, не дойдя до TP1, или итог за ' + G.windowDays + ' дней будет ниже −' + G.lossR + 'R. ' +
+    'О сбое данных дольше часа тоже напишу.');
   if (info.open) lines.push('Сейчас открыто ' + info.open + ' ' + plural(info.open, 'сигнал', 'сигнала', 'сигналов') + ' — о них не пишу, смотрите в приложении.');
+  const srcName = info.src ? info.src.name : '';
   const note = sourceNote(info.src);
-  if (note) lines.push(note);
+  lines.push(note || ('Данные: ' + esc(srcName) + ' — тот же источник, что в приложении по умолчанию.'));
   const url = pagesUrl();
   if (url) lines.push('Приложение: ' + url);
   lines.push('Бот только подсказывает: не торгует и не знает ваших ключей. Не финансовая рекомендация.');
   return lines.join('\n');
 }
+// Сбой данных (о нём пишем, если он длится час и больше) и восстановление.
+function msgOutage(since, nowT, reason) {
+  return '⚠️ <b>Бот не может получить данные</b> с ' + fT(since) + ' (уже ' + fHours(nowT - since) + ').\n' +
+    'Причина: ' + esc(reason) + '.\n' +
+    'Пока сбой не закончится, новые сигналы и события по открытым сигналам не приходят — смотрите приложение.';
+}
+function msgRecovered(since, nowT) {
+  return '✅ <b>Данные снова идут.</b> Перерыв: ' + fHours(nowT - since) + ' (с ' + fT(since) + ').\n' +
+    'События по открытым сигналам догружены. Новые сигналы ищу за последние ~' + fHours(DETECT_WINDOW_MS) + ': более ранние за время перерыва могли быть пропущены.';
+}
+// «Стоп-кран»: реальные сделки идут заметно хуже истории.
+function msgGuard(g) {
+  const lines = ['⚠️ <b>Режим идёт хуже истории</b>'];
+  if (g.streak) lines.push('• ' + G.lossStreak + ' ' + plural(G.lossStreak, 'сделка', 'сделки', 'сделок') + ' подряд ' + (G.lossStreak === 1 ? 'закрылась' : 'закрылись') + ', не дойдя до TP1');
+  if (g.dd) lines.push('• итог за ' + G.windowDays + ' дней: ' + fR(g.sumR) + ' (порог −' + G.lossR + 'R, сделок ' + g.n + ')');
+  lines.push('Сделайте паузу и проверьте режим в приложении (Настройки → Проверка на истории, 90/180 дней).');
+  lines.push('Сигналы продолжу присылать — решение за вами. Когда условие снимется, напишу.');
+  return lines.join('\n');
+}
+function msgGuardClear(g) {
+  return '✅ <b>Стоп-кран снят</b>: серии из ' + G.lossStreak + ' сделок подряд без TP1 нет, итог за ' + G.windowDays + ' дней ' + fR(g.sumR) + '.';
+}
+function plusCount(list) { return list.filter(s => s.status === 'closed' && s.filledT !== null && s.filledT !== undefined && s.resultR > 0).length; }
 function statsLine(list) {
   const s = Signals.stats(list);
   return 'сигналов ' + s.signals + ', входов ' + s.entries + ', закрыто сделок ' + s.n +
-    (s.n ? ' (✓ ' + s.wins + ' / ✗ ' + s.losses + '), итог ' + fR(s.sumR) : '');
+    (s.n ? ' (дошли до TP1: ' + s.wins + ', в плюсе по итогу: ' + plusCount(list) + '), итог ' + fR(s.sumR) : '');
 }
 function msgSummary(st, weekFrom, weekTo) {
   const ann = st.signals.filter(r => r.ann).map(r => r.sig);
@@ -250,10 +388,10 @@ function msgSummary(st, weekFrom, weekTo) {
   const lines = [];
   lines.push('📊 <b>Итоги недели ' + fDay(weekFrom) + '–' + fDay(weekTo - 1) + '</b> (бумажная проверка)');
   lines.push('Новых сигналов: ' + created.length + ' · из них дошли до входа: ' + created.filter(s => s.filledT !== null).length);
-  lines.push('Закрыто сделок: ' + sc.n + (sc.n ? ' — ✓ ' + sc.wins + ' / ✗ ' + sc.losses + ', итог ' + fR(sc.sumR) : ''));
+  lines.push('Закрыто сделок: ' + sc.n + (sc.n ? ' — дошли до TP1: ' + sc.wins + ', в плюсе по итогу: ' + plusCount(closed) + ', итог ' + fR(sc.sumR) : ''));
   lines.push('С начала (' + fDay(st.startedT) + '): ' + statsLine(ann));
   lines.push('Открыто сейчас: ' + open);
-  lines.push('✓ — сделка дошла до TP1. Итог в R — с комиссиями и проскальзыванием, как в приложении.');
+  lines.push('Итог в R — с комиссиями и проскальзыванием, как в приложении. Дойти до TP1 ещё не значит закрыться в плюс.');
   return lines.join('\n');
 }
 function msgChatId(chatId) {
@@ -328,7 +466,7 @@ async function replyChatId() {
 // =====================================================================================
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 const STATUS_FILE = path.join(STATE_DIR, 'status.json');
-function readJSON(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; } }
+function readJSON(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, '')); } catch (e) { return null; } }
 function writeJSON(file, obj) {
   if (NO_WRITE) return;
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -336,14 +474,16 @@ function writeJSON(file, obj) {
   fs.writeFileSync(tmp, JSON.stringify(obj, null, 1) + '\n');
   fs.renameSync(tmp, file);
 }
+// outage — сбой данных { since, notified }; guard — «стоп-кран» { active, since }.
 function newState(nowT) {
-  return { v: STATE_V, startedT: nowT, chatReady: false, signals: [], seen: {}, summaryWeek: null, source: '' };
+  return { v: STATE_V, startedT: nowT, chatReady: false, signals: [], seen: {}, summaryWeek: null, source: '', outage: null, guard: { active: false } };
 }
 // Существенные изменения — повод записать state.json (а workflow — закоммитить). Сдвиг lastT открытых
 // сигналов существенным не считается (сопровождение идемпотентно), кроме отставания больше суток.
 function fingerprint(st) {
   return JSON.stringify({
     v: st.v, start: st.startedT, chat: st.chatReady, week: st.summaryWeek, src: st.source,
+    out: st.outage ? [st.outage.since, !!st.outage.notified] : null, guard: st.guard ? !!st.guard.active : false,
     s: st.signals.map(r => [r.sig.id, r.sig.status, r.sig.outcome, r.sig.tpHit, r.sig.filledT, r.sig.closedT,
       r.ann, r.want, r.sent.status, r.sent.tp, Math.floor((r.sig.lastT || 0) / 86400000)]),
     seen: Object.keys(st.seen).sort()
@@ -381,8 +521,14 @@ function tfPlanFor(presetIds, openLtfs) {
   (openLtfs || []).forEach(tf => want(tf, 'ltf'));
   return plan;
 }
+// Порядок источников: --source; иначе источник качественного режима (как в приложении), затем запасные.
+function sourceOrder() {
+  if (FORCED_SOURCE) return [FORCED_SOURCE];
+  const pref = Q.source && Data.ADAPTERS[Q.source] ? [Q.source] : [];
+  return pref.concat(C.sourceOrder.filter(id => pref.indexOf(id) < 0));
+}
 async function pickSource() {
-  const order = FORCED_SOURCE ? [FORCED_SOURCE] : C.sourceOrder.slice();
+  const order = sourceOrder();
   const fails = [];
   for (const id of order) {
     const ad = Data.ADAPTERS[id];
@@ -517,6 +663,39 @@ function sigLine(s, kept) {
     kept ? '' : '(завершился до показа)', s.id].filter(Boolean).join(' · ');
 }
 
+// «Стоп-кран»: по закрытым сделкам, о которых бот сообщал (были вход и закрытие).
+function guardCheck(st, nowT) {
+  const closed = st.signals.filter(r => r.ann && r.sig.status === 'closed' && r.sig.filledT !== null && r.sig.filledT !== undefined && isNum(r.sig.closedT))
+    .map(r => r.sig).sort((a, b) => a.closedT - b.closedT);
+  const lastN = closed.slice(-G.lossStreak);
+  const streak = G.lossStreak > 0 && lastN.length >= G.lossStreak && lastN.every(s => !s.tpHit[0]);
+  const recent = closed.filter(s => s.closedT >= nowT - G.windowDays * 86400000);
+  const sumR = recent.reduce((a, s) => a + (isNum(s.resultR) ? s.resultR : 0), 0);
+  const dd = recent.length > 0 && sumR <= -G.lossR;
+  return { active: streak || dd, streak, dd, sumR, n: recent.length };
+}
+// Сбой данных: запомнить начало; через час — одно сообщение; после восстановления — одно сообщение (если о сбое писали).
+async function trackOutage(st, isOut, nowT, reason, errors) {
+  let sent = 0;
+  try {
+    if (isOut) {
+      if (!st.outage) st.outage = { since: nowT, notified: false };
+      if (!st.outage.notified && nowT - st.outage.since >= OUTAGE_NOTIFY_MS && CAN_SEND && st.chatReady) {
+        await send(msgOutage(st.outage.since, nowT, reason));
+        st.outage.notified = true;
+        sent++;
+      }
+    } else if (st.outage) {
+      if (st.outage.notified && CAN_SEND && st.chatReady) { await send(msgRecovered(st.outage.since, nowT)); sent++; }
+      if (!st.outage.notified || (CAN_SEND && st.chatReady)) st.outage = null;
+    }
+  } catch (e) {
+    errors.push(mask(e.message));
+    log('Telegram: ' + mask(e.message));
+  }
+  return sent;
+}
+
 async function main() {
   const t0 = Date.now();
   if (DEMO) return demoMessages();
@@ -526,6 +705,8 @@ async function main() {
   const existed = !!(loaded && loaded.v === STATE_V && Array.isArray(loaded.signals));
   const st = existed ? loaded : newState(Date.now());
   if (!st.seen || typeof st.seen !== 'object') st.seen = {};
+  if (st.outage === undefined) st.outage = null;
+  if (!st.guard || typeof st.guard !== 'object') st.guard = { active: false };
   st.signals.forEach(r => { if (!r.sent) r.sent = { status: r.sig.status, tp: r.sig.tpHit.slice() }; });
   const fp0 = existed ? fingerprint(st) : '';
   const errors = [];
@@ -533,21 +714,58 @@ async function main() {
     ts: t0, time: new Date(t0).toISOString(), version: C.version, telegram: MODE,
     profile: Q.strategy, presets: PRESETS, expiryBars: Q.expiryBars, minScore: Q.minScore,
     source: null, sourceFails: [], coins: { want: Q.symbols.length, loaded: 0, skipped: [] },
-    signals: { open: 0, new: 0, events: 0, messages: 0 }, errors: errors, requests: 0, durationMs: 0
+    signals: { open: 0, new: 0, events: 0, messages: 0 }, outageSince: null, guard: false,
+    errors: errors, requests: 0, durationMs: 0
   };
   log('SMC Signals бот · версия ' + C.version + ' · Telegram: ' + MODE + (existed ? '' : ' · новое состояние'));
+  SETTINGS_NOTES.forEach(n => log('Настройки: ' + n));
+  let src = null, messages = 0, events = 0;
+  const found = [];
+
+  // Запись состояния и отчёта — общая для обычного завершения и для сбоя данных.
+  function finish(nowT, forceStatus) {
+    st.signals.forEach(r => { delete r.isNew; });
+    if (src) st.source = src.id;
+    pruneState(st, nowT);
+    const changed = !existed || fingerprint(st) !== fp0;
+    if (changed) writeJSON(STATE_FILE, st);
+    const openList = st.signals.filter(r => Signals.isOpen(r.sig));
+    status.signals = { open: openList.length, new: found.filter(f => f.kept).length, events, messages };
+    status.outageSince = st.outage ? st.outage.since : null;
+    status.guard = !!(st.guard && st.guard.active);
+    status.requests = netRequests;
+    status.durationMs = Date.now() - t0;
+    const wroteStatus = writeStatus(prevStatus, status, changed || forceStatus);
+
+    log('Пресеты: ' + PRESETS.map(presetName).join(', ') + ' · профиль «' + modeShort(Q.strategy) + '» · ожидание ' + Q.expiryBars + ' свечей (' + waitByPreset() + ') · minScore ' + Q.minScore);
+    log('Открытых сигналов: ' + openList.length + ' · найдено в этом запуске: ' + found.length + ' · событий: ' + events + ' · сообщений: ' + messages);
+    if (found.length) {
+      log('Найдено в окне детектора' + (LOOKBACK ? ' (' + LOOKBACK + ' свечей младшего ТФ)' : '') + ':');
+      found.sort((a, b) => a.sig.createdT - b.sig.createdT).forEach(f => log('  ' + sigLine(f.sig, f.kept)));
+    }
+    if (openList.length) {
+      log('Открытые сейчас:');
+      openList.forEach(r => log('  ' + sigLine(r.sig, true) + (r.ann ? ' · показан' : ' · без уведомления')));
+    }
+    if (st.outage) log('Сбой данных с ' + fUTC(st.outage.since) + (st.outage.notified ? ' · сообщение о сбое отправлено' : ' · сообщение — если сбой продлится час'));
+    if (st.guard && st.guard.active) log('Стоп-кран: активен с ' + fUTC(st.guard.since));
+    if (errors.length) log('Ошибки: ' + errors.slice(0, 10).join(' | '));
+    log('Состояние: ' + (changed ? (NO_WRITE ? 'изменилось (не записано: --no-write)' : 'записано') : 'без существенных изменений') +
+      ' · status.json: ' + (wroteStatus && !NO_WRITE ? 'записан' : 'без изменений') +
+      ' · запросов к бирже: ' + netRequests + ' · ' + ((Date.now() - t0) / 1000).toFixed(1) + ' с');
+    return 0;
+  }
 
   // 1. Источник данных.
-  let src;
   try {
     src = await pickSource();
   } catch (e) {
     status.sourceFails = e.fails || [];
     errors.push('Нет данных: ' + e.message);
     log('Источник: ' + e.message + '\n  ' + (e.fails || []).join('\n  '));
-    status.requests = netRequests; status.durationMs = Date.now() - t0;
-    writeStatus(prevStatus, status, true);
-    return 0; // временный сбой источников — не ошибка workflow (без писем о падении каждые 10 минут)
+    const nowT = Date.now();
+    messages += await trackOutage(st, true, nowT, 'ни один источник данных не отвечает', errors);
+    return finish(nowT, false); // временный сбой источников — не ошибка workflow (без писем о падении каждые 10 минут)
   }
   status.source = { id: src.id, name: src.name, market: src.market, host: src.host };
   status.sourceFails = src.fails;
@@ -580,10 +798,13 @@ async function main() {
   log('Монет: ' + active.length + ' из ' + Q.symbols.length + (skipped.length ? ' · пропущены: ' + skipped.map(s => s.coin + ' (' + s.reason + ')').join(', ') : ''));
   if (!active.length) {
     errors.push('ни одна монета не загрузилась');
-    status.requests = netRequests; status.durationMs = Date.now() - t0;
-    writeStatus(prevStatus, status, true);
-    return 0;
+    const nowT = Date.now();
+    messages += await trackOutage(st, true, nowT, 'не загрузилась ни одна монета из ' + Q.symbols.length, errors);
+    return finish(nowT, false);
   }
+  // Частичный сбой: не загрузилась половина монет и больше.
+  const partialOut = skipped.length >= Q.symbols.length / 2;
+  const outReason = 'загрузилось ' + active.length + ' из ' + Q.symbols.length + ' монет';
 
   // 3. Сопровождение открытых сигналов по пропущенным свечам.
   for (const sym of Object.keys(openBySym)) {
@@ -593,7 +814,6 @@ async function main() {
   }
 
   // 4. Детектор и валидатор на последних закрытых свечах.
-  const found = [];
   const B = hasBtc ? series[BTC_SYM] : null;
   for (const c of active) {
     try { detectCoin(st, src, c.coin, c.sym, series[c.sym], B, src.all[c.sym], found, errors); } catch (e) { errors.push(c.coin + ': ' + e.message); }
@@ -605,7 +825,6 @@ async function main() {
   if (MODE === 'setup') {
     try { await replyChatId(); } catch (e) { errors.push(mask(e.message)); }
   }
-  let messages = 0, events = 0;
   if (CAN_SEND) {
     try {
       if (!st.chatReady) {
@@ -615,12 +834,15 @@ async function main() {
         st.chatReady = true;
         messages++;
       }
-      // События по уже показанным сигналам.
+      // Сбой данных (частичный) или восстановление после сбоя.
+      messages += await trackOutage(st, partialOut, nowT, outReason, errors);
+      // События по уже показанным сигналам — со ссылкой на график.
       for (const r of st.signals) {
         if (!r.ann) continue;
         const lines = eventLines(r.sig, r.sent);
         if (!lines.length) continue;
-        await send(lines.join('\n'));
+        const link = sigLink(r.sig);
+        await send((link ? lines.concat(link) : lines).join('\n'));
         r.sent = { status: r.sig.status, tp: r.sig.tpHit.slice() };
         messages++; events += lines.length;
       }
@@ -635,6 +857,17 @@ async function main() {
         r.sent = { status: r.sig.status, tp: r.sig.tpHit.slice() };
         messages++;
       }
+      // «Стоп-кран»: предупреждение при срабатывании, короткое сообщение при снятии; повтор — только после снятия.
+      const g = guardCheck(st, nowT);
+      if (g.active && !st.guard.active) {
+        await send(msgGuard(g));
+        st.guard = { active: true, since: nowT };
+        messages++;
+      } else if (!g.active && st.guard.active) {
+        await send(msgGuardClear(g));
+        st.guard = { active: false };
+        messages++;
+      }
       // Итоги недели — по понедельникам, если бот работал на прошлой неделе.
       const wk = weekStartUTC(nowT), wkKey = new Date(wk).toISOString().slice(0, 10);
       if (new Date(nowT).getUTCDay() === 1 && st.summaryWeek !== wkKey && st.startedT < wk) {
@@ -646,35 +879,11 @@ async function main() {
       errors.push(mask(e.message));
       log('Telegram: ' + mask(e.message));
     }
+  } else {
+    // Без отправки сбой всё равно отслеживается: сообщение уйдёт, когда чат подключат.
+    await trackOutage(st, partialOut, nowT, outReason, errors);
   }
-  st.signals.forEach(r => { delete r.isNew; });
-
-  // 6. Состояние и отчёт.
-  st.source = src.id;
-  pruneState(st, nowT);
-  const changed = !existed || fingerprint(st) !== fp0;
-  if (changed) writeJSON(STATE_FILE, st);
-  const openList = st.signals.filter(r => Signals.isOpen(r.sig));
-  status.signals = { open: openList.length, new: found.filter(f => f.kept).length, events, messages };
-  status.requests = netRequests;
-  status.durationMs = Date.now() - t0;
-  const wroteStatus = writeStatus(prevStatus, status, changed);
-
-  log('Пресеты: ' + PRESETS.map(presetName).join(', ') + ' · профиль «' + modeShort(Q.strategy) + '» · ожидание ' + Q.expiryBars + ' свечей (' + waitByPreset() + ') · minScore ' + Q.minScore);
-  log('Открытых сигналов: ' + openList.length + ' · найдено в этом запуске: ' + found.length + ' · событий: ' + events + ' · сообщений: ' + messages);
-  if (found.length) {
-    log('Найдено в окне детектора' + (LOOKBACK ? ' (' + LOOKBACK + ' свечей младшего ТФ)' : '') + ':');
-    found.sort((a, b) => a.sig.createdT - b.sig.createdT).forEach(f => log('  ' + sigLine(f.sig, f.kept)));
-  }
-  if (openList.length) {
-    log('Открытые сейчас:');
-    openList.forEach(r => log('  ' + sigLine(r.sig, true) + (r.ann ? ' · показан' : ' · без уведомления')));
-  }
-  if (errors.length) log('Ошибки: ' + errors.slice(0, 10).join(' | '));
-  log('Состояние: ' + (changed ? (NO_WRITE ? 'изменилось (не записано: --no-write)' : 'записано') : 'без существенных изменений') +
-    ' · status.json: ' + (wroteStatus && !NO_WRITE ? 'записан' : 'без изменений') +
-    ' · запросов к бирже: ' + netRequests + ' · ' + ((Date.now() - t0) / 1000).toFixed(1) + ' с');
-  return 0;
+  return finish(nowT, false);
 }
 
 // Все виды сообщений на примере (проверка текстов): --demo-messages.
@@ -694,7 +903,9 @@ function demoMessages() {
   const msgs = [];
   msgs.push(msgWelcome({ coins: Q.symbols.length, skipped: 0, open: 2, src: spot }));
   msgs.push(msgChatId('123456789'));
-  msgs.push(msgNewSignal(base, fut, T + 5 * 60000));
+  msgs.push(msgNewSignal(base, spot, T + 5 * 60000));
+  // Тот же сигнал с размером позиции (если депозит не задан — на примере депозита 1000 USDT) или без него.
+  msgs.push(msgNewSignal(base, spot, T + 5 * 60000, SIZE ? null : { deposit: 1000, riskPct: C.calculator.riskPct, leverage: C.calculator.leverage }));
   const h1 = SMC.tfMs('1h'), Ts = Math.floor(nowT / h1) * h1;
   const swing = Signals.create({
     sym: 'SOLUSDT', coin: 'SOL', dir: -1, side: 'SHORT', tf: { ltf: '1h', mtf: '4h', htf: '1d' }, T: Ts, triggerT: Ts - h1,
@@ -702,10 +913,10 @@ function demoMessages() {
     zone: { bot: 149, top: 150, kind: 'ob', t: Ts - 6 * h1 }, poi: null, sweep: null, structure: null, ote: null, inOte: false,
     target: null, bias: null, disp: null, score: 84, factors: [], penalties: []
   }, { fee: C.fees.futures / 100, slip: C.slippagePct / 100, ltfMs: h1, preset: 'swing', mode: Q.strategy, expiryBars: Q.expiryBars, source: 'Binance Futures' });
-  msgs.push(msgNewSignal(swing, fut, Ts + 4 * 60000));
+  msgs.push(msgNewSignal(swing, spot, Ts + 4 * 60000));
   const late = JSON.parse(JSON.stringify(base));
   late.status = 'active'; late.filledT = T + ltfMs;
-  msgs.push(msgNewSignal(late, spot, T + 50 * 60000));
+  msgs.push(msgNewSignal(late, fut, T + 50 * 60000));
   const pend = { status: 'pending', tp: [false, false, false] };
   function run(sig, cds) { const s = JSON.parse(JSON.stringify(sig)); cds.forEach(cd => Signals.step(s, cd, C)); return s; }
   const c = (k, o, h, l, cl) => ({ t: T + k * ltfMs, o, h, l, c: cl, v: 1, closed: true });
@@ -713,31 +924,40 @@ function demoMessages() {
   // сделка закрылась бы на той же свече).
   const k1 = c(1, 100.5, 100.6, 99.8, 100.2), k2 = c(2, 100.2, 102.3, 100.5, 102.1), k3 = c(3, 102.1, 104.3, 102.5, 104.1);
   const filled = run(base, [k1]);
-  msgs.push(eventLines(filled, pend).join('\n'));
+  msgs.push(eventMessage(filled, pend));
   const tp1 = run(base, [k1, k2]);
-  msgs.push(eventLines(tp1, { status: 'active', tp: [false, false, false] }).join('\n'));
+  msgs.push(eventMessage(tp1, { status: 'active', tp: [false, false, false] }));
   const tp2 = run(base, [k1, k2, k3]);
-  msgs.push(eventLines(tp2, { status: 'active', tp: [true, false, false] }).join('\n'));
+  msgs.push(eventMessage(tp2, { status: 'active', tp: [true, false, false] }));
   const tp3 = run(base, [k1, k2, k3, c(4, 104, 109.5, 103.9, 109)]);
-  msgs.push(eventLines(tp3, { status: 'active', tp: [true, true, false] }).join('\n'));
+  msgs.push(eventMessage(tp3, { status: 'active', tp: [true, true, false] }));
   const slh = run(base, [k1, c(2, 100, 100.3, 97.5, 97.8)]);
-  msgs.push(eventLines(slh, { status: 'active', tp: [false, false, false] }).join('\n'));
-  const beh = run(base, [k1, k2, c(3, 102, 102.2, 99.9, 100)]);
-  msgs.push(eventLines(beh, { status: 'active', tp: [true, false, false] }).join('\n'));
-  const tp2stop = run(base, [k1, k2, k3, c(4, 104, 104.2, 101.8, 102)]);
-  msgs.push(eventLines(tp2stop, { status: 'active', tp: [true, true, false] }).join('\n'));
+  msgs.push(eventMessage(slh, { status: 'active', tp: [false, false, false] }));
+  // Стоп после TP1 и после TP2 — по текущему сопровождению CONFIG.tp.moveStop: свеча задевает именно его.
+  const s1 = run(base, [k1, k2]).stop, s2 = run(base, [k1, k2, k3]).stop;
+  const beh = run(base, [k1, k2, c(3, 102, 102.2, s1 - 0.05, s1 + 0.1)]);
+  if (Signals.isOpen(beh)) throw new Error('демо: стоп после TP1 не сработал');
+  msgs.push(eventMessage(beh, { status: 'active', tp: [true, false, false] }));
+  const tp2stop = run(base, [k1, k2, k3, c(4, 104, 104.2, s2 - 0.05, s2 + 0.1)]);
+  if (Signals.isOpen(tp2stop)) throw new Error('демо: стоп после TP2 не сработал');
+  msgs.push(eventMessage(tp2stop, { status: 'active', tp: [true, true, false] }));
   const exp = JSON.parse(JSON.stringify(base));
   exp.status = 'expired'; exp.outcome = 'expired'; exp.closedT = exp.expiresT;
-  msgs.push(eventLines(exp, pend).join('\n'));
+  msgs.push(eventMessage(exp, pend));
   const inv = JSON.parse(JSON.stringify(base));
   inv.status = 'invalidated'; inv.outcome = 'invalidated'; inv.closedT = T + 2 * ltfMs; inv.note = 'закрытие тела за зоной до входа';
-  msgs.push(eventLines(inv, pend).join('\n'));
+  msgs.push(eventMessage(inv, pend));
   const fastAll = run(base, [k1, k2]);
-  msgs.push(eventLines(fastAll, pend).join('\n'));
+  msgs.push(eventMessage(fastAll, pend));
   const st = newState(nowT - 20 * 86400000);
   const wk = weekStartUTC(nowT);
   [tp3, slh, beh, filled].forEach((s, k) => st.signals.push({ sig: Object.assign({}, s, { createdT: wk - (6 - k) * 86400000, closedT: s.closedT ? wk - (5 - k) * 86400000 : null }), ann: true, sent: pend }));
   msgs.push(msgSummary(st, wk - 7 * 86400000, wk));
+  // Сбой данных и восстановление, «стоп-кран» и его снятие.
+  msgs.push(msgOutage(nowT - 75 * 60000, nowT, 'ни один источник данных не отвечает'));
+  msgs.push(msgRecovered(nowT - 2 * 3600000, nowT));
+  msgs.push(msgGuard({ streak: true, dd: true, sumR: -5.6, n: 9 }));
+  msgs.push(msgGuardClear({ sumR: -2.1 }));
   return (async () => { for (const m of msgs) await send(m); log('\nПоказано сообщений: ' + msgs.length); return 0; })();
 }
 

@@ -43,14 +43,40 @@ var Backtest = (function () {
     return runInner(opts, onProgress, my).then(function (res) { job = null; return res; }, function (e) { job = null; throw e; });
   }
 
+  // Сопровождение сделки: вариант из CONFIG.managementVariants подменяет доли TP и перенос стопа (только в прогоне).
+  function withManagement(K, id) {
+    var v = id && C.managementVariants[id];
+    if (!v) return K;
+    var out = {};
+    Object.keys(K).forEach(function (k) { out[k] = K[k]; });
+    out.tp = {};
+    Object.keys(K.tp).forEach(function (k) { out.tp[k] = K.tp[k]; });
+    out.tp.fractions = v.fractions.slice();
+    out.tp.moveStop = v.moveStop.slice();
+    return out;
+  }
+  // Какой вариант сопровождения совпадает с текущими настройками CONFIG.tp.
+  function currentManagement() {
+    var ids = Object.keys(C.managementVariants);
+    for (var k = 0; k < ids.length; k++) {
+      var v = C.managementVariants[ids[k]];
+      if (String(v.fractions) === String(C.tp.fractions) && String(v.moveStop) === String(C.tp.moveStop)) return ids[k];
+    }
+    return null;
+  }
+
   function runInner(opts, onProgress, my) {
     var P = C.presets[opts.presetId] || C.presets.main;
     // Профиль: запрошенный и фактический для пресета (в частом профиле скальп идёт по мягким правилам — как в live).
     var reqMode = C.strategyModes[opts.mode] ? opts.mode : 'strict';
-    var mode = profileFor(reqMode, P.id), K = configFor(mode);
+    var mode = profileFor(reqMode, P.id);
+    var management = C.managementVariants[opts.management] ? opts.management : currentManagement();
+    var K = withManagement(configFor(mode), opts.management);
     var expiryBars = opts.expiryBars > 0 ? Math.round(opts.expiryBars) : C.lifecycle.expiryBars; // ожидание входа, свечей LTF
     var ms = { L: SMC.tfMs(P.ltf), M: SMC.tfMs(P.mtf), H: SMC.tfMs(P.htf) };
-    var nowT = Data.now();
+    // endOffsetDays — период заканчивается столько дней назад (проверка на независимом, более раннем отрезке).
+    var offsetMs = opts.endOffsetDays > 0 ? Math.round(opts.endOffsetDays) * DAY : 0;
+    var nowT = Data.now() - offsetMs;
     var endT = Math.floor((nowT - C.network.closeGraceMs) / ms.L) * ms.L - ms.L; // открытие последней закрытой свечи
     var startT = endT + ms.L - opts.days * DAY;
     var warm = {
@@ -215,19 +241,22 @@ var Backtest = (function () {
           presetId: P.id, presetName: P.name, days: opts.days, startT: startT, endT: endT + ms.L,
           minScore: opts.minScore, feePct: opts.feePct, slipPct: opts.slipPct, longOnly: !!opts.longOnly,
           coins: covered, source: opts.adapter.name, ts: Date.now(), tf: P,
-          mode: mode, requestedMode: reqMode, modeName: C.strategyModes[mode].name, expiryBars: expiryBars
+          mode: mode, requestedMode: reqMode, modeName: C.strategyModes[mode].name, expiryBars: expiryBars,
+          management: management, offsetDays: offsetMs ? Math.round(offsetMs / DAY) : 0
         };
         var result = aggregate(all, meta);
         result.funnel = fun;
         result.rejects = Object.keys(rejects).map(function (k) { return { text: rejects[k].text, n: rejects[k].n }; })
           .sort(function (a, b) { return b.n - a.n; });
         result.warnings = warnings;
-        // readOnly — прогон для проверки live-настроек: калибровку и сравнение вариантов не трогаем.
-        if (covered.length && !opts.readOnly) { // калибровка своя для каждого пресета и профиля
+        // readOnly — прогон для проверки live-настроек; прошлый период и другое сопровождение тоже не пишутся
+        // в калибровку и сравнение вариантов: те описывают текущие настройки на свежей истории.
+        var keep = !opts.readOnly && !offsetMs && management === currentManagement();
+        if (covered.length && keep) { // калибровка своя для каждого пресета и профиля
           Signals.Calib.update(all, covered, { ts: meta.ts, days: opts.days, minScore: opts.minScore, preset: P.id, mode: mode, expiryBars: expiryBars });
           result.calibrated = true;
         }
-        if (!opts.readOnly) savePresetCompare(result);
+        if (keep) savePresetCompare(result);
         prog('done', 1, 'Готово');
         return result;
       });
@@ -249,7 +278,45 @@ var Backtest = (function () {
       inS: Signals.stats(all.filter(function (x) { return x.createdT < splitT; })),
       outS: Signals.stats(all.filter(function (x) { return x.createdT >= splitT; }))
     };
-    return { meta: meta, signals: all, summary: summary, byCoin: byCoin, byBucket: byBucket, split: split, byMonth: monthBlocks(all, meta.startT, meta.endT) };
+    return {
+      meta: meta, signals: all, summary: summary, byCoin: byCoin, byBucket: byBucket, split: split,
+      byMonth: monthBlocks(all, meta.startT, meta.endT), spread: spread(all)
+    };
+  }
+
+  // Разброс итога. Бутстрэп: те же сделки выбираются случайно с возвращением — каким мог бы выйти итог при той же
+  // точности. Плюс просадка при случайном порядке тех же сделок. Генератор с фиксированным зерном: цифры не «прыгают».
+  function rng(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function spread(list, iters) {
+    var rs = list.filter(function (s) { return s.status === 'closed' && s.filledT != null && isFinite(s.resultR); })
+      .map(function (s) { return s.resultR; });
+    var n = rs.length;
+    if (n < 2) return null;
+    iters = iters || C.backtest.spreadIters;
+    var r = rng(20261121 + n), sums = new Float64Array(iters), dds = new Float64Array(iters), arr = rs.slice();
+    for (var i = 0; i < iters; i++) {
+      var s = 0;
+      for (var k = 0; k < n; k++) s += rs[Math.floor(r() * n)];
+      sums[i] = s;
+      for (var j = n - 1; j > 0; j--) { var q = Math.floor(r() * (j + 1)), tmp = arr[j]; arr[j] = arr[q]; arr[q] = tmp; }
+      var eq = 0, peak = 0, dd = 0;
+      for (var m = 0; m < n; m++) { eq += arr[m]; if (eq > peak) peak = eq; if (peak - eq > dd) dd = peak - eq; }
+      dds[i] = dd;
+    }
+    sums.sort(); dds.sort();
+    function pct(a, p) { return a[Math.min(a.length - 1, Math.max(0, Math.round(p * (a.length - 1))))]; }
+    var neg = 0;
+    for (var z = 0; z < iters; z++) if (sums[z] <= 0) neg++;
+    return { n: n, iters: iters, p5: pct(sums, 0.05), p50: pct(sums, 0.5), p95: pct(sums, 0.95), pNeg: neg / iters, dd95: pct(dds, 0.95) };
   }
 
   // Итоги по «месяцам» — блокам по 30 дней от конца периода к началу (последний блок самый свежий и полный).
@@ -329,7 +396,7 @@ var Backtest = (function () {
       days: days.map(function (x) { return { t: x.t, n: x.n, e: x.e }; }), nDays: nd,
       avg: nd ? sumN / nd : NaN, avgEntries: nd ? sumE / nd : NaN, ge3: ge3, zero: zero,
       min: nd ? min : NaN, max: nd ? max : NaN, summary: agg.summary, split: agg.split,
-      months: agg.byMonth, posMonths: agg.byMonth.filter(function (m) { return m.sumR > 0; }).length
+      months: agg.byMonth, posMonths: agg.byMonth.filter(function (m) { return m.sumR > 0; }).length, spread: agg.spread
     };
   }
 
@@ -374,6 +441,7 @@ var Backtest = (function () {
 
   return {
     run: run, cancel: cancel, isRunning: isRunning, toCSV: toCSV, aggregate: aggregate, FUNNEL: FUNNEL,
-    mergeLive: mergeLive, countByDay: countByDay, liveSummary: liveSummary, monthBlocks: monthBlocks
+    mergeLive: mergeLive, countByDay: countByDay, liveSummary: liveSummary, monthBlocks: monthBlocks,
+    spread: spread, currentManagement: currentManagement
   };
 })();

@@ -391,7 +391,11 @@ var Signals = (function () {
     sig.exits.forEach(function (e) { used += e.frac; });
     var rest = Math.max(0, 1 - used);
     if (rest > 1e-9) sig.exits.push({ kind: 'stop', price: price, frac: rest, t: t });
-    sig.outcome = !sig.tpHit[0] ? 'sl' : (!sig.tpHit[1] ? 'be' : 'tp2');
+    // Исход — по тому, где стоял стоп: на SL, в безубытке или на TP1 (зависит от сопровождения CONFIG.tp.moveStop).
+    var kind = sig.stop === sig.sl ? 'sl' : (sig.stop === sig.tp1 ? 'tp1' : 'be');
+    if (!sig.tpHit[0]) sig.outcome = 'sl';
+    else if (!sig.tpHit[1]) sig.outcome = kind === 'sl' ? 'tp1sl' : 'be';
+    else sig.outcome = kind === 'tp1' ? 'tp2' : (kind === 'be' ? 'tp2be' : 'tp2sl');
     sig.status = 'closed';
     sig.closedT = t;
     sig.resultR = computeR(sig);
@@ -466,7 +470,7 @@ var Signals = (function () {
   function isSuccess(sig) { return sig.status === 'closed' && sig.tpHit[0]; }
 
   var OUTCOME = {
-    sl: 'SL', be: 'TP1 → безубыток', tp2: 'TP2 → стоп на TP1', tp3: 'TP3',
+    sl: 'SL', be: 'TP1 → безубыток', tp1sl: 'TP1 → стоп по SL', tp2: 'TP2 → стоп на TP1', tp2be: 'TP2 → безубыток', tp2sl: 'TP2 → стоп по SL', tp3: 'TP3',
     expired: 'Просрочен', missed: 'Просрочен (TP1 без входа)', target: 'Отменён: TP3 без входа', invalidated: 'Отменён (зона)'
   };
   function statusText(sig) {
@@ -522,7 +526,7 @@ var Signals = (function () {
     var eq = 0, peak = 0, dd = 0, streak = 0, maxStreak = 0, comp = 1, curve = [];
     trades.forEach(function (t) {
       if (t.tpHit[0]) wins++;
-      if (t.outcome === 'be') be++;
+      if (t.outcome === 'be' || t.outcome === 'tp2be') be++;
       for (var k = 0; k < 3; k++) if (t.tpHit[k]) tp[k]++;
       var r = t.resultR || 0;
       sumR += r;

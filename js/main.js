@@ -15,7 +15,8 @@ var App = (function () {
   // ---------- настройки ----------
   function defaults() {
     return {
-      source: 'auto', mode: 'both', minScore: C.minScore, riskPct: C.calculator.riskPct,
+      // По умолчанию свечи Binance Spot — те же, что видит Telegram-бот на GitHub; комиссия — как на фьючерсах.
+      source: 'binanceSpot', tradeMarket: 'futures', mode: 'both', minScore: C.minScore, riskPct: C.calculator.riskPct,
       feeFutures: C.fees.futures, feeSpot: C.fees.spot, slipPct: C.slippagePct,
       symbols: C.symbols.slice(), sound: true, strategy: C.defaultStrategy, expiryBars: C.lifecycle.expiryBars,
       notify: false, notifyStatus: false, livePreset: C.defaultPreset
@@ -28,6 +29,7 @@ var App = (function () {
   function sanitize(s) {
     var d = defaults(), o = {};
     o.source = (s.source === 'auto' || Data.ADAPTERS[s.source]) ? s.source : d.source;
+    o.tradeMarket = s.tradeMarket === 'spot' ? 'spot' : 'futures';
     o.mode = s.mode === 'long' ? 'long' : 'both';
     o.minScore = Math.round(numIn(s.minScore, 60, 100, d.minScore));
     o.riskPct = numIn(s.riskPct, 0.05, 20, d.riskPct);
@@ -82,9 +84,10 @@ var App = (function () {
     return sanitize(s && typeof s === 'object' ? s : {});
   }
   function saveSettings() { Store.set(C.storage.settings, app.settings); }
+  // Комиссия — по рынку, где пользователь торгует (настройка), а не по источнику свечей: данные можно брать
+  // со спота, а торговать фьючерсами.
   function marketFee() {
-    var m = feed && feed.status.market;
-    return m === 'spot' ? app.settings.feeSpot : app.settings.feeFutures;
+    return app.settings.tradeMarket === 'spot' ? app.settings.feeSpot : app.settings.feeFutures;
   }
 
   // ---------- лог ----------
@@ -483,7 +486,10 @@ var App = (function () {
   // ---------- бэктест ----------
   function btDefaults() {
     return {
-      params: { coin: 'all', days: C.backtest.defaultDays, presetId: C.defaultPreset, minScore: app.settings.minScore, feePct: C.fees.futures, slipPct: app.settings.slipPct, mode: app.settings.strategy, expiryBars: app.settings.expiryBars },
+      params: {
+        coin: 'all', days: C.backtest.defaultDays, presetId: C.defaultPreset, minScore: app.settings.minScore, feePct: C.fees.futures, slipPct: app.settings.slipPct,
+        mode: app.settings.strategy, expiryBars: app.settings.expiryBars, management: Backtest.currentManagement() || 'base', prev: false
+      },
       running: false, progress: { frac: 0, text: '' }, result: null, error: ''
     };
   }
@@ -501,11 +507,13 @@ var App = (function () {
     if (C.lifecycle.expiryOptions.indexOf(p.expiryBars) < 0) p.expiryBars = app.settings.expiryBars;
     bt.running = true; bt.error = ''; bt.progress = { frac: 0, text: 'Старт…' };
     if (UI.current() === 'backtest') UI.update('backtest', true);
-    log('info', 'Бэктест: ' + C.presets[p.presetId].name + ', профиль «' + C.strategyModes[p.mode].name + '», ' + p.days + ' дн, монет ' + coins.length + ', minScore ' + p.minScore + ', ожидание входа ' + p.expiryBars + ' свечей');
+    if (!C.managementVariants[p.management]) p.management = Backtest.currentManagement() || 'base';
+    log('info', 'Бэктест: ' + C.presets[p.presetId].name + ', профиль «' + C.strategyModes[p.mode].name + '», ' + p.days + ' дн' + (p.prev ? ' до последних ' + p.days : '') +
+      ', монет ' + coins.length + ', minScore ' + p.minScore + ', ожидание входа ' + p.expiryBars + ' свечей, сопровождение «' + C.managementVariants[p.management].name + '»');
     Backtest.run({
       adapter: feed.adapter, base: feed.base, coins: coins, hasBtc: feed.hasBtc, days: p.days, presetId: p.presetId,
       minScore: p.minScore, feePct: p.feePct, slipPct: p.slipPct, longOnly: app.settings.mode === 'long', mode: p.mode,
-      expiryBars: p.expiryBars
+      expiryBars: p.expiryBars, management: p.management, endOffsetDays: p.prev ? p.days : 0
     }, function (pr) {
       bt.progress = pr;
       if (UI.current() === 'backtest') UI.updateBtProgress();
@@ -524,6 +532,7 @@ var App = (function () {
   // Калибровка точности: бэктест 60 дней по указанному пресету (по умолчанию — главный из активных).
   app.calibrate = function (presetId) {
     var p = app.bt.params;
+    p.management = Backtest.currentManagement() || 'base'; p.prev = false; // калибровка — по текущим настройкам на свежей истории
     p.coin = 'all'; p.days = C.calibration.days; p.presetId = C.presets[presetId] ? presetId : primaryPreset(); p.minScore = app.settings.minScore;
     p.feePct = marketFee(); p.slipPct = app.settings.slipPct; p.mode = app.settings.strategy; p.expiryBars = app.settings.expiryBars;
     UI.show('backtest');
@@ -536,14 +545,31 @@ var App = (function () {
     var s = app.settings;
     return { strategy: s.strategy, livePreset: s.livePreset, expiryBars: s.expiryBars, minScore: s.minScore, mode: s.mode, coins: s.symbols.join(',') };
   }
-  function lcDefaults() {
-    var saved = Store.get(C.storage.liveCheck, null);
-    var ok = saved && saved.v === 2 && Array.isArray(saved.days) && Array.isArray(saved.months) && saved.snap && typeof saved.ts === 'number';
-    var days = ok && C.liveCheck.options.indexOf(saved.period) >= 0 ? saved.period : C.liveCheck.days;
-    return { running: false, cancel: false, progress: { frac: 0, text: '' }, res: ok ? saved : null, error: '', days: days };
+  function lcPeriod(id) {
+    var ps = C.liveCheck.periods;
+    for (var k = 0; k < ps.length; k++) if (ps[k].id === id) return ps[k];
+    return null;
   }
-  // Период проверки: 90 или 180 дней.
-  app.setLiveCheckDays = function (d) { if (C.liveCheck.options.indexOf(d) >= 0 && !app.lc.running) app.lc.days = d; };
+  // Результаты хранятся по каждому периоду: свежий и независимый отрезок можно сравнить рядом.
+  function lcDefaults() {
+    var saved = Store.get(C.storage.liveCheck, null), byPeriod = {};
+    if (saved && saved.v === 3 && saved.byPeriod && typeof saved.byPeriod === 'object') {
+      Object.keys(saved.byPeriod).forEach(function (id) {
+        var r = saved.byPeriod[id];
+        if (lcPeriod(id) && r && Array.isArray(r.months) && Array.isArray(r.days) && r.snap && typeof r.ts === 'number') byPeriod[id] = r;
+      });
+    }
+    var period = saved && lcPeriod(saved.last) ? saved.last : C.liveCheck.defaultPeriod;
+    return { running: false, cancel: false, progress: { frac: 0, text: '' }, byPeriod: byPeriod, period: period, res: byPeriod[period] || null, error: '' };
+  }
+  // Период проверки: 90 дней, 180 дней или 180 дней до них (независимый отрезок).
+  app.setLiveCheckPeriod = function (id) {
+    if (!lcPeriod(id) || app.lc.running) return;
+    app.lc.period = id;
+    app.lc.res = app.lc.byPeriod[id] || null;
+    app.lc.error = '';
+  };
+  app.liveCheckPeriod = lcPeriod;
   function numOrNull(x) { return (typeof x === 'number' && isFinite(x)) ? x : null; }
   // Настройки live изменились после последней проверки — её цифры относятся к другим настройкам.
   app.liveCheckStale = function () {
@@ -556,16 +582,16 @@ var App = (function () {
     if (!feed || !feed.adapter || !feed.coins.length || !app.ready) { UI.toast('Данные ещё загружаются — запустите проверку чуть позже', 'bad'); return; }
     if (app.bt.running || Backtest.isRunning()) { UI.toast('Идёт бэктест — дождитесь его окончания', 'bad'); return; }
     var pids = activePresets(), coins = feed.coins.slice(), snap = lcSnapshot();
-    var days = C.liveCheck.options.indexOf(lc.days) >= 0 ? lc.days : C.liveCheck.days;
+    var PER = lcPeriod(lc.period) || lcPeriod(C.liveCheck.defaultPeriod), days = PER.days;
     var base = {
-      adapter: feed.adapter, base: feed.base, coins: coins, hasBtc: feed.hasBtc, days: days,
+      adapter: feed.adapter, base: feed.base, coins: coins, hasBtc: feed.hasBtc, days: days, endOffsetDays: PER.offset,
       minScore: app.settings.minScore, feePct: marketFee(), slipPct: app.settings.slipPct,
       longOnly: app.settings.mode === 'long', mode: app.settings.strategy, expiryBars: app.settings.expiryBars, readOnly: true
     };
     var results = [], k = 0;
     lc.running = true; lc.cancel = false; lc.error = ''; lc.progress = { frac: 0, text: 'Старт…' };
     UI.updateLiveCheck(true);
-    log('info', 'Проверка на истории: ' + days + ' дн, пресеты ' + pids.map(function (p) { return C.presets[p].short; }).join(' + ') +
+    log('info', 'Проверка на истории: ' + PER.label + (PER.offset ? ' (независимый отрезок)' : '') + ', пресеты ' + pids.map(function (p) { return C.presets[p].short; }).join(' + ') +
       ', профиль «' + C.strategyModes[snap.strategy].name + '», монет ' + coins.length + ', ожидание ' + snap.expiryBars + ' свечей, minScore ' + snap.minScore);
     function next() {
       if (lc.cancel) return Promise.reject(new Error('отменено'));
@@ -589,8 +615,10 @@ var App = (function () {
         (r.warnings || []).forEach(function (w) { if (warnings.indexOf(w) < 0) warnings.push(w); });
         r.meta.coins.forEach(function (c) { covered[c] = true; });
       });
+      var sp = sum.spread;
       lc.res = {
-        v: 2, ts: Date.now(), period: days, snap: snap, fromT: fromT, toT: toT, presets: pids, source: feed.adapter.name,
+        ts: Date.now(), period: PER.id, periodDays: PER.days, offset: PER.offset, snap: snap, fromT: fromT, toT: toT, presets: pids, source: feed.adapter.name,
+        spread: sp ? { n: sp.n, iters: sp.iters, p5: sp.p5, p50: sp.p50, p95: sp.p95, pNeg: sp.pNeg, dd95: sp.dd95 } : null,
         months: sum.months.map(function (m) {
           return { from: m.from, to: m.to, days: m.days, signals: m.signals, entries: m.entries, n: m.n, wins: m.wins, losses: m.losses, sumR: m.sumR, pf: numOrNull(m.pf), pfInf: m.pf === Infinity };
         }),
@@ -602,10 +630,12 @@ var App = (function () {
         sumR: st.sumR, pf: numOrNull(st.pf), pfInf: st.pf === Infinity, compPct: st.compPct, maxDD: st.maxDD,
         outN: o.n, outWins: o.wins, outSumR: o.sumR, warnings: warnings.slice(0, 10)
       };
-      Store.set(C.storage.liveCheck, lc.res);
+      lc.byPeriod[PER.id] = lc.res;
+      Store.set(C.storage.liveCheck, { v: 3, last: PER.id, byPeriod: lc.byPeriod });
       lc.running = false; lc.progress = { frac: 1, text: '' };
-      log('info', 'Проверка на истории (' + days + ' дн) завершена: в среднем ' + (lc.res.avg === null ? '—' : lc.res.avg.toFixed(1)) +
-        ' сигнала в день, сделок ' + st.n + ', итог ' + st.sumR.toFixed(2) + 'R, месяцев в плюсе ' + sum.posMonths + ' из ' + sum.months.length);
+      log('info', 'Проверка на истории (' + PER.label + ') завершена: в среднем ' + (lc.res.avg === null ? '—' : lc.res.avg.toFixed(2)) +
+        ' сигнала в день, сделок ' + st.n + ', итог ' + st.sumR.toFixed(2) + 'R, месяцев в плюсе ' + sum.posMonths + ' из ' + sum.months.length +
+        (sp ? ', разброс 90%: ' + sp.p5.toFixed(1) + '…' + sp.p95.toFixed(1) + 'R, итог ≤ 0 в ' + Math.round(sp.pNeg * 100) + '% повторов' : ''));
       UI.toast('Проверка на истории завершена', 'good');
       UI.updateLiveCheck(true);
     }).then(null, function (e) {
@@ -615,6 +645,45 @@ var App = (function () {
     });
   };
   app.cancelLiveCheck = function () { if (app.lc.running) { app.lc.cancel = true; Backtest.cancel(); } };
+
+  // ---------- «стоп-кран» по журналу: реальные сделки идут заметно хуже истории ----------
+  // lossStreak неуспешных сделок подряд или итог сделок, закрытых за windowDays дней, не больше −lossR.
+  app.guardStatus = function () {
+    var g = C.guard;
+    var trades = Signals.Journal.list.filter(function (s) { return s.status === 'closed' && s.filledT != null && isFinite(s.resultR); });
+    trades.sort(function (a, b) { return a.closedT - b.closedT; });
+    var last = trades.slice(-g.lossStreak);
+    var streak = last.length === g.lossStreak && last.every(function (s) { return !s.tpHit[0]; });
+    var since = Data.now() - g.windowDays * 86400000, sum = 0, n = 0;
+    trades.forEach(function (s) { if (s.closedT >= since) { sum += s.resultR; n++; } });
+    var deep = n > 0 && sum <= -g.lossR;
+    return { active: streak || deep, streak: streak, deep: deep, sumR: sum, n: n };
+  };
+
+  // ---------- ссылка из Telegram: #sig=<id сигнала> или #coin=<МОНЕТА> ----------
+  // Открывает на экране «Сейчас» карточку этого сигнала с графиком; если сигнала в журнале нет — график монеты.
+  app.focus = null;
+  function readHash() {
+    var raw = String(location.hash || '').replace(/^#/, ''), m, prev = app.focus;
+    try { raw = decodeURIComponent(raw); } catch (e) { raw = ''; }
+    if ((m = /^sig=([A-Za-z0-9._-]{3,80})$/.exec(raw))) {
+      var sym = m[1].split('-')[0], coin = sym.length > C.quote.length && sym.slice(-C.quote.length) === C.quote ? sym.slice(0, -C.quote.length) : null;
+      app.focus = { sig: m[1], coin: coin };
+    } else if ((m = /^coin=([A-Za-z0-9]{2,15})$/.exec(raw))) {
+      app.focus = { sig: null, coin: m[1].toUpperCase() };
+    } else app.focus = null;
+    return JSON.stringify(prev) !== JSON.stringify(app.focus);
+  }
+  app.focusSignal = function () {
+    var f = app.focus;
+    if (!f || !f.sig) return null;
+    return Signals.Journal.list.filter(function (s) { return s.id === f.sig; })[0] || null;
+  };
+  app.clearFocus = function () {
+    app.focus = null;
+    try { history.replaceState(null, '', location.pathname + location.search); } catch (e) { location.hash = ''; }
+    UI.update('best', true);
+  };
 
   app.exportCSV = function () {
     var res = app.bt.result;
@@ -669,11 +738,14 @@ var App = (function () {
     var q = C.qualityPreset;
     log('info', 'Включён качественный режим: профиль «' + C.strategyModes[q.strategy].name + '», ' +
       q.presets.map(function (p) { return C.presets[p].short; }).join(' + ') + ', монет ' + q.symbols.length + ', ожидание ' + q.expiryBars + ' свечей, minScore ' + q.minScore);
-    app.updateSettings({ strategy: q.strategy, livePreset: qualityLive(), expiryBars: q.expiryBars, minScore: q.minScore, symbols: q.symbols.slice() }, true);
+    var patch = { strategy: q.strategy, livePreset: qualityLive(), expiryBars: q.expiryBars, minScore: q.minScore, symbols: q.symbols.slice() };
+    if (q.source) patch.source = q.source;
+    app.updateSettings(patch, true);
   };
   app.isQuality = function () {
     var q = C.qualityPreset, s = app.settings;
     return s.strategy === q.strategy && s.livePreset === qualityLive() && s.expiryBars === q.expiryBars && s.minScore === q.minScore &&
+      (!q.source || s.source === q.source) &&
       s.symbols.length === q.symbols.length && q.symbols.every(function (c) { return s.symbols.indexOf(c) >= 0; });
   };
   app.setCoins = function (text) {
@@ -829,13 +901,21 @@ var App = (function () {
       Signals.step(s, { t: 2 * M15, o: 100.2, h: 103, l: 97.5, c: 101 }, C);
       return s.status === 'closed' && s.outcome === 'sl' && !s.tpHit[0] && s.resultR < -1;
     });
-    test('TP1, затем безубыток: результат с комиссиями и проскальзыванием', function () {
-      var s = sig(1);
-      Signals.step(s, { t: M15, o: 100.5, h: 100.8, l: 99.9, c: 100.2 }, C);
-      Signals.step(s, { t: 2 * M15, o: 100.2, h: 102.5, l: 99.5, c: 100 }, C);
+    test('Сопровождение: TP1 → безубыток (как в промпте) и «безубыток только после TP2»; итог с комиссиями и проскальзыванием', function () {
+      var s = sig(1), b0 = { tp: Object.assign({}, C.tp, { moveStop: ['be', 'tp1'] }), lifecycle: C.lifecycle };
+      Signals.step(s, { t: M15, o: 100.5, h: 100.8, l: 99.9, c: 100.2 }, b0);
+      Signals.step(s, { t: 2 * M15, o: 100.2, h: 102.5, l: 99.5, c: 100 }, b0);
       var be = 100 * (1 + 2 * 0.0005), ex = be * (1 - 0.0003);
       var gross = 0.4 * 2 + 0.6 * (ex - 100), fees = 100 * 0.0005 + 0.4 * 102 * 0.0005 + 0.6 * ex * 0.0005;
-      return s.outcome === 'be' && s.tpHit[0] && !s.tpHit[1] && Math.abs(s.resultR - (gross - fees) / 2) < 1e-9;
+      // Вариант «безубыток только после TP2»: после TP1 стоп остаётся на SL — те же свечи, затем стоп по SL.
+      var v1 = { tp: Object.assign({}, C.tp, { moveStop: [null, 'be'] }), lifecycle: C.lifecycle }, s1 = sig(1);
+      Signals.step(s1, { t: M15, o: 100.5, h: 100.8, l: 99.9, c: 100.2 }, v1);
+      Signals.step(s1, { t: 2 * M15, o: 100.2, h: 102.5, l: 99.5, c: 100 }, v1);
+      var stillOpen = s1.status === 'active' && s1.tpHit[0] && s1.stop === 98;
+      Signals.step(s1, { t: 3 * M15, o: 100, h: 100.5, l: 97.5, c: 98 }, v1);
+      return s.outcome === 'be' && s.tpHit[0] && !s.tpHit[1] && Math.abs(s.resultR - (gross - fees) / 2) < 1e-9 &&
+        stillOpen && s1.status === 'closed' && s1.outcome === 'tp1sl' && s1.resultR < 0 &&
+        Signals.OUTCOME.tp1sl === 'TP1 → стоп по SL' && Backtest.currentManagement() === 'beAfterTp2';
     });
     test('Просрочка: нет входа за 12 свечей 15m; срок из настройки (24 свечи) фиксируется в сигнале', function () {
       var s = sig(1), ok11 = false;
@@ -916,7 +996,21 @@ var App = (function () {
         q.symbols.every(function (c) { return CONFIG.wideSymbols.indexOf(c) >= 0; }) && CONFIG.wideSymbols.length <= CONFIG.maxSymbols &&
         q.presets.every(function (p) { return !!CONFIG.presets[p]; }) && !!CONFIG.strategyModes[q.strategy] &&
         CONFIG.lifecycle.expiryOptions.indexOf(q.expiryBars) >= 0;
-      return profiles && plan && merge && months && quality;
+      // Разброс итога: одинаковые сделки — разброса нет; повтор даёт те же цифры (фиксированное зерно).
+      function tr(r) { return { status: 'closed', filledT: 1, resultR: r }; }
+      var allWin = Backtest.spread([tr(1), tr(1), tr(1), tr(1)], 200);
+      var mixed = [tr(2), tr(-1), tr(-1), tr(0.3), tr(1.5), tr(-1.2)];
+      var sp1 = Backtest.spread(mixed, 300), sp2 = Backtest.spread(mixed, 300);
+      var spreadOk = allWin.p5 === 4 && allWin.p95 === 4 && allWin.pNeg === 0 && allWin.dd95 === 0 &&
+        sp1.p5 === sp2.p5 && sp1.p95 === sp2.p95 && sp1.pNeg === sp2.pNeg && sp1.p5 <= sp1.p50 && sp1.p50 <= sp1.p95 &&
+        sp1.pNeg > 0 && sp1.pNeg < 1 && Backtest.spread([tr(1)]) === null;
+      // Варианты сопровождения: доли в сумме 1, текущий CONFIG.tp совпадает с одним из вариантов.
+      var mv = CONFIG.managementVariants;
+      var mgmt = Object.keys(mv).every(function (k) {
+        var v = mv[k];
+        return v.fractions.length === 3 && Math.abs(v.fractions[0] + v.fractions[1] + v.fractions[2] - 1) < 1e-9 && v.moveStop.length === 2;
+      }) && !!Backtest.currentManagement();
+      return profiles && plan && merge && months && quality && spreadOk && mgmt;
     });
     test('Сглаживание точности: (успехи + 10p) / (n + 10)', function () {
       return Math.abs(Signals.smooth(10, 20, 0.5, 10) - 0.5) < 1e-12 && Math.abs(Signals.smooth(18, 20, 0.5, 10) - 23 / 30) < 1e-12 &&
@@ -953,6 +1047,8 @@ var App = (function () {
     feed = new Data.Feed(hooks);
     app.feed = feed;
     UI.renderStatus(feed.status);
+    readHash();
+    window.addEventListener('hashchange', function () { if (readHash() && app.focus) UI.show('best'); });
     UI.show('best');
     feed.setExtra(Signals.Journal.openFor(null).map(function (s) { return s.sym; }));
     feed.start(0);

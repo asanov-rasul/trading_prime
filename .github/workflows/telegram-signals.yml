@@ -44,6 +44,12 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Личные настройки (необязательно). Лучше задавать секретами: значения секретов скрыты в логе запуска.
+          # Можно и переменными репозитория (вкладка Variables) — но тогда значение видно в публичном логе.
+          BOT_TZ: ${{ secrets.BOT_TZ || vars.BOT_TZ }}
+          BOT_DEPOSIT: ${{ secrets.BOT_DEPOSIT || vars.BOT_DEPOSIT }}
+          BOT_RISK_PCT: ${{ secrets.BOT_RISK_PCT || vars.BOT_RISK_PCT }}
+          BOT_LEVERAGE: ${{ secrets.BOT_LEVERAGE || vars.BOT_LEVERAGE }}
         run: |
           node --version
           node bot/run.js --state state

@@ -65,16 +65,23 @@ var Calc = (function () {
       return { usd: net, gross: gross, fees: fees, pct: net / p.deposit * 100, r: net / riskUsd };
     }
     var be = dir === 1 ? p.entry * (1 + 2 * fee) : p.entry * (1 - 2 * fee);
+    // Куда переносится стоп после TP1 и TP2 — как в сопровождении CONFIG.tp.moveStop ('be', 'tp1' или null — не двигать).
+    var mv = Array.isArray(p.moveStop) ? p.moveStop : CONFIG.tp.moveStop;
+    function stopAfter(kind, prev) { return kind === 'be' ? be : (kind === 'tp1' ? tps[0] : prev); }
+    var stop1 = stopAfter(mv[0], p.sl), stop2 = stopAfter(mv[1], stop1);
     var sc = {
       sl: scenario([{ price: p.sl, frac: 1, stop: true }]),
-      tp1be: scenario([{ price: tps[0], frac: fr[0] }, { price: be, frac: 1 - fr[0], stop: true }]),
-      tp12: scenario([{ price: tps[0], frac: fr[0] }, { price: tps[1], frac: fr[1] }, { price: tps[0], frac: 1 - fr[0] - fr[1], stop: true }]),
+      tp1stop: scenario([{ price: tps[0], frac: fr[0] }, { price: stop1, frac: 1 - fr[0], stop: true }]),
+      tp12: scenario([{ price: tps[0], frac: fr[0] }, { price: tps[1], frac: fr[1] }, { price: stop2, frac: 1 - fr[0] - fr[1], stop: true }]),
       all: scenario([{ price: tps[0], frac: fr[0] }, { price: tps[1], frac: fr[1] }, { price: tps[2], frac: fr[2] }])
     };
+    sc.tp1be = sc.tp1stop; // прежнее имя — для совместимости
+    res.moveStop = [mv[0] || null, mv[1] || null];
     var rr = tps.map(function (t) { return pos(t) ? (t - p.entry) * dir / riskPerUnit : NaN; });
     var rrAvg = tpOk ? fr[0] * rr[0] + fr[1] * rr[1] + fr[2] * rr[2] : NaN;
     var prob = num(p.prob) && p.prob >= 0 && p.prob <= 1 ? p.prob : null;
-    var ev = (prob !== null && sc.sl && sc.tp1be) ? prob * sc.tp1be.usd + (1 - prob) * sc.sl.usd : null;
+    // Осторожная оценка: при успехе (TP1) остаток закрывается по стопу после TP1, при неуспехе — по SL.
+    var ev = (prob !== null && sc.sl && sc.tp1stop) ? prob * sc.tp1stop.usd + (1 - prob) * sc.sl.usd : null;
 
     if (pos(p.minOrder) && notional < p.minOrder) W('warn', 'Позиция ' + notional.toFixed(2) + ' USDT меньше минимального ордера ' + p.minOrder + ' USDT');
     if (margin > p.deposit) W('error', 'Требуемая маржа ' + margin.toFixed(2) + ' USDT больше депозита');

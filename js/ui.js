@@ -394,7 +394,20 @@ var UI = (function () {
     ];
     return h('div', null,
       tableWrap(mkTable(['Уровень', 'Цена', '% от входа', 'R'], rows, { cls: 'levels' })),
-      h('div', { class: 'muted small zone-line' }, 'Зона входа: ' + fP(sig.zone.bot) + '–' + fP(sig.zone.top) + ' (' + sig.zone.kind.toUpperCase() + '), риск ' + fN(sig.riskPct, 2) + '% от входа'));
+      h('div', { class: 'muted small zone-line' }, 'Зона входа: ' + fP(sig.zone.bot) + '–' + fP(sig.zone.top) + ' (' + sig.zone.kind.toUpperCase() + '), риск ' + fN(sig.riskPct, 2) + '% от входа'),
+      h('div', { class: 'muted small' }, managementText()));
+  }
+  // Название стопа после TP: 'be' — безубыток, 'tp1' — стоп на TP1, null — стоп не двигается (prev).
+  function stopName(kind, prev) {
+    var k = kind || prev;
+    return k === 'be' ? 'безубыток' : (k === 'tp1' ? 'стоп на TP1' : 'стоп по SL');
+  }
+  // Сопровождение одной строкой — по CONFIG.tp (доли и перенос стопа).
+  function managementText() {
+    var mv = C.tp.moveStop, f = C.tp.fractions;
+    function act(k, prev) { return k === 'be' ? 'стоп в безубыток' : (k === 'tp1' ? 'стоп на TP1' : (prev ? 'стоп не двигаем' : 'стоп остаётся на SL')); }
+    return 'Сопровождение: на TP1 закрыть ' + Math.round(f[0] * 100) + '% — ' + act(mv[0], false) + '; на TP2 закрыть ' + Math.round(f[1] * 100) + '% — ' +
+      act(mv[1], true) + '; остаток — на TP3.';
   }
   function whyList(sig) {
     var ul = h('ul', { class: 'why' });
@@ -481,18 +494,59 @@ var UI = (function () {
     var PP = C.presets[App.primaryPreset()];
     return tableWrap(mkTable(['Монета', 'Цена', 'Тренд ' + PP.htf.toUpperCase(), 'Статус', 'Score'], rows, { cls: 'coins' }));
   }
+  // «Стоп-кран»: реальные сделки журнала идут заметно хуже истории (пороги — CONFIG.guard).
+  function guardNote() {
+    var g = App.guardStatus(), G = C.guard;
+    if (!g.active) return null;
+    var why = [];
+    if (g.streak) why.push(G.lossStreak + ' неуспешных сделок подряд');
+    if (g.deep) why.push('итог за ' + G.windowDays + ' дней ' + fR(g.sumR));
+    return h('div', { class: 'note err' }, '⚠️ Режим идёт хуже истории: ' + why.join(', ') + '. Сделайте паузу и проверьте режим: Настройки → «Проверка на истории» (90 и 180 дней).');
+  }
+  // Карточка из ссылки Telegram (#sig=… или #coin=…): сигнал из журнала с графиком, иначе график монеты.
+  function focusCard(f) {
+    var head = h('div', { class: 'row-btns focus-head' }, h('span', { class: 'chip live' }, 'Из Telegram'),
+      h('button', { type: 'button', class: 'btn small', onclick: function () { App.clearFocus(); } }, 'Скрыть'));
+    var sig = App.focusSignal();
+    if (sig) {
+      var card = signalCardFull(sig);
+      card.insertBefore(head, card.firstChild);
+      return card;
+    }
+    var coin = f.coin, sym = coin ? coin + C.quote : null, tf = C.presets[App.primaryPreset()].ltf;
+    var box = h('div', { class: 'card' }, head, h('h3', { class: 'card-title' }, coin ? 'График ' + coin + ' · ' + tf : 'Сигнал из Telegram'));
+    if (!App.ready) { box.appendChild(h('p', { class: 'muted' }, 'Загружаю данные…')); return box; }
+    if (f.sig) box.appendChild(h('div', { class: 'note' }, 'Этого сигнала нет в журнале приложения: возможно, он уже завершился, найден по другим свечам или приложение было закрыто. Ниже — график монеты.'));
+    var cds = sym ? App.candlesFor(sym, tf) : null;
+    if (!cds || !cds.length) {
+      box.appendChild(h('p', { class: 'muted' }, coin ? 'Монеты ' + coin + ' нет в вашем списке — добавьте её в Настройках, чтобы видеть график.' : 'Монета не указана.'));
+      return box;
+    }
+    var cv = h('canvas', { class: 'chart', 'aria-label': 'График ' + coin });
+    box.appendChild(h('div', { class: 'chart-box' }, cv));
+    var draw = function () {
+      drawCandles(cv, App.candlesFor(sym, tf), { levels: [{ price: App.priceOf(sym), color: cssVar('--muted', '#94a3b8'), label: 'Цена', dash: true }] });
+    };
+    charts.push(draw);
+    requestAnimationFrame(draw);
+    return box;
+  }
   function renderBest() {
     var root = $('screen-best');
     clear(root);
     root.appendChild(h('h2', { class: 'screen-title' }, 'Лучшая сделка сейчас'));
-    var best = App.bestSignal();
-    if (best) root.appendChild(signalCardFull(best));
+    var gnb = guardNote();
+    if (gnb) root.appendChild(gnb);
+    if (App.focus) root.appendChild(focusCard(App.focus));
+    var best = App.bestSignal(), focusSig = App.focus ? App.focusSignal() : null;
+    if (best && focusSig && best.id === focusSig.id) { /* лучший сигнал уже показан карточкой из Telegram */ }
+    else if (best) root.appendChild(signalCardFull(best));
     else {
       var st = App.feedStatus();
       if (st.state === 'error' || (st.state === 'loading' && st.error)) {
         root.appendChild(h('div', { class: 'card empty' },
           h('div', { class: 'empty-title' }, 'Нет связи с биржами'),
-          h('p', { class: 'muted' }, (st.error || 'Нет ответа').replace(/[.\s]+$/, '') + '. Приложение само повторяет подключение и перебирает источники: Binance Futures → Binance Spot → Bybit. Проверьте интернет; если биржи заблокированы в вашей сети, данные не загрузятся.')));
+          h('p', { class: 'muted' }, (st.error || 'Нет ответа').replace(/[.\s]+$/, '') + '. Приложение само повторяет подключение. Источник выбирается в Настройках (по умолчанию Binance Spot, режим «Авто» перебирает Binance Futures → Binance Spot → Bybit). Проверьте интернет; если биржи заблокированы в вашей сети, данные не загрузятся.')));
       } else {
         var msg = st.state === 'loading' || !st.lastUpdate ? 'Загружаю данные и анализирую рынок…' : 'Сейчас нет качественных сетапов — лучше ждать';
         var soft = App.settings.strategy !== 'strict', pids = App.activePresets();
@@ -528,6 +582,8 @@ var UI = (function () {
     clear(root);
     root.appendChild(h('h2', { class: 'screen-title' }, 'Сигналы'));
     root.appendChild(h('div', { class: 'note' }, 'Сигналы по разным монетам сильно коррелируют: не открывайте больше 2–3 сделок одновременно.'));
+    var gn = guardNote();
+    if (gn) root.appendChild(gn);
     var all = Signals.Journal.list.slice();
     var coins = [];
     all.forEach(function (s) { if (coins.indexOf(s.coin) < 0) coins.push(s.coin); });
@@ -538,8 +594,8 @@ var UI = (function () {
     var st = Signals.stats(list);
     root.appendChild(section('Статистика журнала (live)', h('div', { class: 'kv-grid' },
       kv('Сигналов', String(st.signals)), kv('Открыто', String(st.open)),
-      kv('Закрытых сделок', String(st.n)), kv('Успешных ✓', st.n ? st.wins + ' (' + fRate(st.winRate) + ')' : '—', 'good'),
-      kv('Неуспешных ✗', st.n ? st.losses + ' (' + fRate(st.lossRate) + ')' : '—', 'bad'), kv('✓ затем безубыток', String(st.be)),
+      kv('Закрытых сделок', String(st.n)), kv('Дошли до TP1 ✓', st.n ? st.wins + ' (' + fRate(st.winRate) + ')' : '—', 'good'),
+      kv('Не дошли до TP1 ✗', st.n ? st.losses + ' (' + fRate(st.lossRate) + ')' : '—', 'bad'), kv('✓ затем безубыток', String(st.be)),
       kv('Просрочено', String(st.expired + st.invalidated)), kv('Средний результат', fR(st.avgR)),
       kv('Сумма', st.n ? fR(st.sumR) : '—'), kv('Profit factor', isNum(st.pf) ? fN(st.pf, 2) : (st.pf === Infinity ? '∞' : '—'))
     )));
@@ -640,18 +696,19 @@ var UI = (function () {
       kv('Риск на сделку', fN(r.riskUsd, 2) + ' USDT (' + fN(r.riskUsd / s.deposit * 100, 2) + '%)'),
       kv('Риск на монету', fP(r.riskPerUnit) + ' USDT'),
       kv('Ликвидация (оценка, изол.)', r.liq ? fP(r.liq) : 'нет при 1x'),
-      kv('Безубыток после TP1', fP(r.be))
+      kv(r.moveStop[0] === 'be' ? 'Безубыток (стоп после TP1)' : (r.moveStop[1] === 'be' ? 'Безубыток (стоп после TP2)' : 'Безубыток'), fP(r.be))
     )));
     var sc = r.scenarios;
     function row(name, x) { return { cells: [name, x ? { v: fUsd(x.usd), cls: x.usd >= 0 ? 'good' : 'bad' } : '—', x ? fPct(x.pct) : '—', x ? fR(x.r) : '—', x ? fN(x.fees, 3) : '—'] }; }
     box.appendChild(section('Сценарии (с комиссиями)', tableWrap(mkTable(['Сценарий', 'USDT', '% депозита', 'R', 'Комиссии'], [
-      row('SL', sc.sl), row('TP1, затем безубыток', sc.tp1be), row('TP1 и TP2 (остаток по TP1)', sc.tp12), row('Все три TP', sc.all)
+      row('SL', sc.sl), row('TP1, затем ' + stopName(r.moveStop[0], 'sl'), sc.tp1stop),
+      row('TP1 и TP2, затем ' + stopName(r.moveStop[1], r.moveStop[0] || 'sl'), sc.tp12), row('Все три TP', sc.all)
     ]))));
     box.appendChild(section('R:R и ожидание', h('div', { class: 'kv-grid' },
       kv('R:R TP1 / TP2 / TP3', fN(r.rr[0], 2) + ' / ' + fN(r.rr[1], 2) + ' / ' + fN(r.rr[2], 2)),
       kv('Средний R:R (по долям)', fN(r.rrAvg, 2)),
       kv('Матожидание', r.ev === null ? 'укажите p' : fUsd(r.ev) + ' USDT', r.ev > 0 ? 'good' : (r.ev < 0 ? 'bad' : '')),
-      kv('Формула', 'p × «TP1→БУ» + (1 − p) × «SL»')
+      kv('Формула', 'p × «TP1, затем ' + stopName(r.moveStop[0], 'sl') + '» + (1 − p) × «SL»')
     )));
   }
 
@@ -679,7 +736,11 @@ var UI = (function () {
       field('Пресет таймфреймов', select(presetOpts, p.presetId, function (e) { p.presetId = e.target.value; }), 'сравнивайте пресеты только по контрольным 30%'),
       field('minScore', numInput(p.minScore, { min: 60, max: 100, step: 1, oninput: function (e) { p.minScore = Number(e.target.value); } })),
       field('Комиссия за сторону, %', numInput(p.feePct, { min: 0, step: 0.01, oninput: function (e) { p.feePct = Number(e.target.value); } }), '0.05 — фьючерсы, 0.1 — спот'),
-      field('Проскальзывание на стопе, %', numInput(p.slipPct, { min: 0, step: 0.01, oninput: function (e) { p.slipPct = Number(e.target.value); } }))
+      field('Проскальзывание на стопе, %', numInput(p.slipPct, { min: 0, step: 0.01, oninput: function (e) { p.slipPct = Number(e.target.value); } })),
+      field('Сопровождение сделки', select(Object.keys(C.managementVariants).map(function (k) {
+        return [k, C.managementVariants[k].name + (k === Backtest.currentManagement() ? ' — сейчас' : '')];
+      }), p.management, function (e) { p.management = e.target.value; }), 'сравнивайте варианты на обоих отрезках: последние N дней и N дней до них'),
+      field('Отрезок', seg([['0', 'Последние N дней'], ['1', 'N дней до них']], p.prev ? '1' : '0', function (v) { p.prev = v === '1'; renderBacktest(); }), 'N — выбранный период; «до них» — более ранний, независимый отрезок')
     );
     var btns = h('div', { class: 'row-btns' },
       bt.running
@@ -718,22 +779,28 @@ var UI = (function () {
   function renderBtResult(root, res) {
     var m = res.meta, s = res.summary;
     var modeTxt = modeName(m.mode) + (m.requestedMode && m.requestedMode !== m.mode ? ' (выбран «' + modeName(m.requestedMode) + '»: на этом пресете — правила «' + modeName(m.mode) + '»)' : '');
-    root.appendChild(h('div', { class: 'note' }, m.presetName + ' · профиль «' + modeTxt + '» · ожидание входа ' + waitText(m.expiryBars, m.tf && m.tf.ltf) + ' · ' + m.days + ' дн (' + fDate(m.startT) + ' — ' + fDate(m.endT) + ') · minScore ' + m.minScore + ' · комиссия ' + m.feePct + '% · проскальзывание ' + m.slipPct + '% · ' + m.source + (m.longOnly ? ' · только LONG' : '')));
+    var mg = C.managementVariants[m.management];
+    root.appendChild(h('div', { class: 'note' }, m.presetName + ' · профиль «' + modeTxt + '» · ожидание входа ' + waitText(m.expiryBars, m.tf && m.tf.ltf) + ' · ' + m.days + ' дн' +
+      (m.offsetDays ? ' до последних ' + m.offsetDays + ' (независимый отрезок)' : '') + ' (' + fDate(m.startT) + ' — ' + fDate(m.endT) + ') · minScore ' + m.minScore +
+      ' · комиссия ' + m.feePct + '% · проскальзывание ' + m.slipPct + '% · сопровождение «' + (mg ? mg.name : 'свои настройки') + '» · ' + m.source + (m.longOnly ? ' · только LONG' : '')));
+    if (m.offsetDays || m.management !== Backtest.currentManagement()) root.appendChild(h('div', { class: 'note' }, 'Прогон не по текущим настройкам на свежей истории — калибровка и сравнение вариантов не обновлялись.'));
     if (s.n < C.backtest.minTrades) root.appendChild(h('div', { class: 'note warn' }, 'Выборка мала, выводы ненадёжны (сделок: ' + s.n + ', нужно хотя бы ' + C.backtest.minTrades + ').'));
     (res.warnings || []).forEach(function (w) { root.appendChild(h('div', { class: 'note warn' }, w)); });
     if (res.calibrated) root.appendChild(h('div', { class: 'note good' }, 'Калибровка точности обновлена: профиль «' + modeName(m.mode) + '», пресет ' + (C.presets[m.presetId] || C.presets.main).short + '.'));
     root.appendChild(section('Сводка', h('div', { class: 'kv-grid' },
       kv('Сигналов', String(s.signals)), kv('Входов', String(s.entries)),
       kv('Просрочено', String(s.expired + s.invalidated)), kv('Открыто на конец', String(s.open)),
-      kv('Успешных ✓', s.n ? s.wins + ' (' + fRate(s.winRate) + ')' : '—', 'good'),
-      kv('Неуспешных ✗', s.n ? s.losses + ' (' + fRate(s.lossRate) + ')' : '—', 'bad'),
+      kv('Дошли до TP1 ✓', s.n ? s.wins + ' (' + fRate(s.winRate) + ')' : '—', 'good'),
+      kv('Не дошли до TP1 ✗', s.n ? s.losses + ' (' + fRate(s.lossRate) + ')' : '—', 'bad'),
       kv('✓ затем безубыток', String(s.be)),
       kv('TP1 / TP2 / TP3', fRate(s.tpRate[0]) + ' / ' + fRate(s.tpRate[1]) + ' / ' + fRate(s.tpRate[2])),
       kv('Средний результат', fR(s.avgR)), kv('Матожидание на сделку', fR(s.avgR)),
       kv('Profit factor', isNum(s.pf) ? fN(s.pf, 2) : (s.pf === Infinity ? '∞' : '—')),
       kv('Макс. просадка', fR(-s.maxDD)),
       kv('Итог при риске 1%', fPct(s.compPct) + ' (сложный процент)'),
-      kv('Серия неуспешных', String(s.maxLossStreak))
+      kv('Серия неуспешных', String(s.maxLossStreak)),
+      kv('Разброс итога, 90% повторов', res.spread ? fR(res.spread.p5) + ' … ' + fR(res.spread.p95) : '—'),
+      kv('Итог ≤ 0 в повторах', res.spread ? Math.round(res.spread.pNeg * 100) + '% (просадка до ' + fR(-res.spread.dd95) + ')' : '—')
     )));
     var cv = h('canvas', { class: 'chart eq', 'aria-label': 'Кривая капитала в R' });
     root.appendChild(section('Кривая капитала, R', cv));
@@ -758,7 +825,10 @@ var UI = (function () {
     renderTradeList(root, res);
   }
   function outcomeCell(sig) {
-    if (sig.status === 'closed') return { v: sig.tpHit[0] ? (sig.outcome === 'be' ? '✓ БУ' : '✓ ' + (sig.outcome || '').toUpperCase()) : '✗ SL', cls: sig.tpHit[0] ? 'good' : 'bad' };
+    if (sig.status === 'closed') {
+      var OUT = { be: '✓ TP1 → БУ', tp1sl: '✓ TP1 → SL', tp2: '✓ TP2 → TP1', tp2be: '✓ TP2 → БУ', tp2sl: '✓ TP2 → SL', tp3: '✓ TP3' };
+      return { v: sig.tpHit[0] ? (OUT[sig.outcome] || '✓ ' + String(sig.outcome || '').toUpperCase()) : '✗ SL', cls: sig.resultR > 0 ? 'good' : 'bad' };
+    }
     if (sig.status === 'expired' || sig.status === 'invalidated') return { v: 'просрочен', cls: 'muted' };
     return { v: 'открыт', cls: 'muted' };
   }
@@ -768,7 +838,7 @@ var UI = (function () {
       if (btFilter.coin !== 'all' && x.coin !== btFilter.coin) return false;
       if (btFilter.out === 'win') return x.status === 'closed' && x.tpHit[0];
       if (btFilter.out === 'loss') return x.status === 'closed' && !x.tpHit[0];
-      if (btFilter.out === 'be') return x.status === 'closed' && x.outcome === 'be';
+      if (btFilter.out === 'be') return x.status === 'closed' && (x.outcome === 'be' || x.outcome === 'tp2be');
       if (btFilter.out === 'expired') return x.status === 'expired' || x.status === 'invalidated';
       if (btFilter.out === 'open') return Signals.isOpen(x);
       return true;
@@ -844,11 +914,18 @@ var UI = (function () {
     var pids = App.activePresets();
     body.push(h('p', { class: 'muted small' }, 'Прогон текущих настроек live по истории: те же detect() и validate(), что в live, по всем монетам списка и всем включённым пресетам (сейчас: ' +
       pids.map(function (p) { return C.presets[p].short; }).join(', ') + '). Смотрите не только на общий итог, но и на месяцы: ровный результат важнее одного удачного месяца. Калибровку и результаты бэктеста проверка не меняет.'));
-    body.push(field('Период', seg(C.liveCheck.options.map(function (d) { return [d, d + ' дней']; }), lc.days, function (v) {
+    body.push(field('Период', seg(C.liveCheck.periods.map(function (p) { return [p.id, p.label]; }), lc.period, function (v) {
       if (lc.running) return;
-      App.setLiveCheckDays(Number(v));
+      App.setLiveCheckPeriod(v);
       updateLiveCheck(true);
-    })));
+    }), '«180 дней до них» — 181–360 дней назад: на этом отрезке состав режима не выбирался, поэтому это честная проверка'));
+    var ra = lc.byPeriod.d180, rb = lc.byPeriod.prev180;
+    if (ra && rb && !lc.running) {
+      var both = ra.sumR > 0 && rb.sumR > 0, sameSet = JSON.stringify(ra.snap) === JSON.stringify(rb.snap);
+      body.push(h('div', { class: 'note ' + (both ? 'good' : 'warn') }, 'Последние 180 дней: ' + fR(ra.sumR) + ' (' + ra.n + ' ' + plural(ra.n, 'сделка', 'сделки', 'сделок') + ', в плюсе ' + ra.posMonths + ' из ' + ra.months.length + ' мес.) · 180 дней до них: ' +
+        fR(rb.sumR) + ' (' + rb.n + ' ' + plural(rb.n, 'сделка', 'сделки', 'сделок') + ', в плюсе ' + rb.posMonths + ' из ' + rb.months.length + ' мес.). ' +
+        (both ? 'Плюс держится на обоих отрезках.' : 'На одном из отрезков итог не в плюсе — преимущество не подтверждено.') + (sameSet ? '' : ' Проверки сделаны с разными настройками — запустите обе заново.')));
+    }
     if (lc.running) {
       body.push(h('div', { class: 'progress' }, h('div', { class: 'bar', style: 'width:' + Math.round((lc.progress.frac || 0) * 100) + '%' })));
       body.push(h('div', { class: 'muted small', id: 'lc-progress-text' }, lc.progress.text || ''));
@@ -863,17 +940,21 @@ var UI = (function () {
       var rules = (r.presets || []).map(function (p, k) {
         return (r.modes && r.modes[k] && r.modes[k] !== r.snap.strategy) ? ' (' + C.presets[p].short + ' — по правилам «' + modeName(r.modes[k]) + '»)' : '';
       }).join('');
-      body.push(h('div', { class: 'note' }, 'Проверено ' + fDT(r.ts) + ' · ' + r.period + ' дней: ' + fDate(r.fromT) + ' — ' + fDate(r.toT) + ' · профиль «' + modeName(r.snap.strategy) + '»' + rules +
+      var perText = r.offset ? r.periodDays + ' дней до последних ' + r.offset + ' (независимый отрезок)' : r.periodDays + ' дней';
+      body.push(h('div', { class: 'note' }, 'Проверено ' + fDT(r.ts) + ' · ' + perText + ': ' + fDate(r.fromT) + ' — ' + fDate(r.toT) + ' · профиль «' + modeName(r.snap.strategy) + '»' + rules +
         ' · пресеты: ' + (r.presets || []).map(function (p) { return C.presets[p].short; }).join(', ') + ' · монет ' + r.coins + ' · ожидание входа ' + r.snap.expiryBars + ' ' +
         plural(r.snap.expiryBars, 'свеча', 'свечи', 'свечей') + ' · minScore ' + r.snap.minScore + (r.snap.mode === 'long' ? ' · только LONG' : '') + ' · ' + r.source));
       if (App.liveCheckStale()) body.push(h('div', { class: 'note warn' }, 'Настройки live изменились после проверки: цифры ниже относятся к прежним настройкам. Запустите проверку заново.'));
-      var nm = r.months.length;
+      var nm = r.months.length, sp = r.spread;
       body.push(h('div', { class: 'kv-grid' },
         kv('Месяцев в плюсе', r.posMonths + ' из ' + nm, nm && r.posMonths === nm ? 'good' : (r.posMonths * 2 < nm ? 'bad' : '')),
         kv('Итог', fR(r.sumR), rCls(r.sumR)),
+        kv('Разброс итога, 90% повторов', sp ? fR(sp.p5) + ' … ' + fR(sp.p95) : '—', sp ? (sp.p5 > 0 ? 'good' : (sp.p95 < 0 ? 'bad' : '')) : ''),
+        kv('Итог ≤ 0 в повторах', sp ? Math.round(sp.pNeg * 100) + '%' : '—', sp ? (sp.pNeg >= 0.2 ? 'bad' : (sp.pNeg <= 0.05 ? 'good' : '')) : ''),
+        kv('Просадка, 95% повторов', sp ? fR(-sp.dd95) : '—'),
         kv('Сделок за период', String(r.n)),
-        kv('Успешных ✓', r.n ? r.wins + ' (' + fRate(r.winRate) + ')' : '—', 'good'),
-        kv('Неуспешных ✗', r.n ? String(r.losses) : '—', 'bad'),
+        kv('Дошли до TP1 ✓', r.n ? r.wins + ' (' + fRate(r.winRate) + ')' : '—', 'good'),
+        kv('Не дошли до TP1 ✗', r.n ? String(r.losses) : '—', 'bad'),
         kv('Profit factor', isNum(r.pf) ? fN(r.pf, 2) : (r.pfInf ? '∞' : '—')),
         kv('Макс. просадка', fR(-r.maxDD)),
         kv('Итог при риске 1%', fPct(r.compPct) + ' (сложный процент)'),
@@ -889,6 +970,7 @@ var UI = (function () {
       (r.warnings || []).forEach(function (w) { body.push(h('div', { class: 'note warn' }, w)); });
       body.push(h('ul', { class: 'why-extra' }, [
         h('li', null, 'Месяц — блок 30 дней от даты проверки назад. Если в половине месяцев минус, общий итог держится на одном-двух удачных отрезках.'),
+        h('li', null, 'Разброс — бутстрэп: из тех же сделок ' + (sp ? sp.iters : C.backtest.spreadIters) + ' раз набирается случайная выборка того же размера. Если в заметной доле повторов итог не выше нуля, плюс может быть случайным. Просадка — при случайном порядке тех же сделок.'),
         h('li', null, 'Сигналы в день считаются по полным суткам по вашему времени (' + r.nDays + ' ' + plural(r.nDays, 'день', 'дня', 'дней') + '), сделки — за весь период.'),
         h('li', null, 'Пресеты прогоняются отдельно и объединяются по правилам live: по монете одновременно открыт один сигнал, пауза после SL общая. Это приближение к live, а не точная копия.'),
         h('li', null, 'Прошлые месяцы не гарантируют будущих.')
@@ -938,7 +1020,8 @@ var UI = (function () {
     var qWait = qp.presets.map(function (p) { return C.presets[p].short + ' — ' + hoursText(qp.expiryBars, C.presets[p].ltf); }).join(', ');
     root.appendChild(section('Качественный режим', [
       h('p', { class: 'muted small' }, 'Профиль «' + modeName(qp.strategy) + '», ' + qp.presets.map(function (p) { return C.presets[p].name; }).join(' + ') + ', ' +
-        qp.symbols.length + ' монет, ожидание входа ' + qp.expiryBars + ' ' + plural(qp.expiryBars, 'свеча', 'свечи', 'свечей') + ' младшего ТФ (' + qWait + '), minScore ' + qp.minScore + '.'),
+        qp.symbols.length + ' монет, ожидание входа ' + qp.expiryBars + ' ' + plural(qp.expiryBars, 'свеча', 'свечи', 'свечей') + ' младшего ТФ (' + qWait + '), minScore ' + qp.minScore +
+        (qp.source && Data.ADAPTERS[qp.source] ? ', свечи ' + Data.ADAPTERS[qp.source].name + ' — как у Telegram-бота' : '') + '.'),
       h('ul', { class: 'why-extra' }, [
         h('li', null, 'Лучший из проверенных вариантов, но преимущество небольшое, а сделок на истории мало. Состав выбран правилом, заданным до проверки.'),
         h('li', null, 'Сигналов немного. Добрать их без потери качества не получилось: на истории не держались ни ослабленные правила (частый профиль), ни новые монеты (широкий список).'),
@@ -1013,7 +1096,8 @@ var UI = (function () {
       ])
     ]));
     root.appendChild(section('Данные и режим', h('div', { class: 'form-grid' },
-      field('Источник данных', select(srcOpts, s.source, function (e) { App.updateSettings({ source: e.target.value }, true); })),
+      field('Источник данных', select(srcOpts, s.source, function (e) { App.updateSettings({ source: e.target.value }, true); }), 'Binance Spot — как у Telegram-бота, тогда сигналы совпадают'),
+      field('Где торгуете (для комиссий)', seg([['futures', 'Фьючерсы'], ['spot', 'Спот']], s.tradeMarket, function (v) { App.updateSettings({ tradeMarket: v }, false); renderSettings(); }), 'комиссия берётся по рынку сделки, а не по источнику свечей'),
       field('Режим сигналов', seg([['both', 'LONG и SHORT'], ['long', 'Только LONG']], s.mode, function (v) { App.updateSettings({ mode: v }, false); renderSettings(); }), '«Только LONG» — для спота'),
       field('minScore (порог публикации)', numInput(s.minScore, { min: 60, max: 100, step: 1, onchange: function (e) { App.updateSettings({ minScore: Number(e.target.value) }, false); renderSettings(); } }), 'от 60 до 100, по умолчанию ' + C.minScore),
       field('Риск на сделку, %', numInput(s.riskPct, { min: 0.1, max: 10, step: 0.1, onchange: function (e) { App.updateSettings({ riskPct: Number(e.target.value) }, false); } })),
