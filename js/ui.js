@@ -743,6 +743,10 @@ var UI = (function () {
     root.appendChild(section('Контроль: первые 70% и последние 30% периода', tableWrap(mkTable(STATS_HEAD, [
       statsRow('Первые 70%', res.split.inS), statsRow('Последние 30% (контроль)', res.split.outS)
     ]))));
+    if (res.byMonth && res.byMonth.length > 1) {
+      root.appendChild(section('По месяцам (блоки по 30 дней, справа — последний)', [monthBars(res.byMonth), monthTable(res.byMonth, false),
+        h('div', { class: 'muted small' }, 'Ровный результат по месяцам важнее общего итога: один удачный месяц может перекрыть несколько убыточных.')]));
+    }
     root.appendChild(section('По монетам', tableWrap(mkTable(STATS_HEAD, res.byCoin.map(function (x) { return statsRow(x.coin, x.s); })))));
     root.appendChild(section('По корзинам score (из неё считается калибровка)', tableWrap(mkTable(STATS_HEAD, res.byBucket.map(function (x) { return statsRow(x.label, x.s); })))));
     if (res.funnel) {
@@ -804,34 +808,47 @@ var UI = (function () {
     }
   }
 
-  // ---------- проверка «Сигналов в день» (все цифры — из App.runLiveCheck) ----------
+  // ---------- проверка на истории: сигналы в день и итог по месяцам (все цифры — из App.runLiveCheck) ----------
   function fDay(t, wd) { return new Date(t).toLocaleDateString('ru-RU', wd ? { weekday: 'short', day: '2-digit', month: '2-digit' } : { day: '2-digit', month: '2-digit' }); }
-  // Столбики «сигналов за день»: зелёные — 3 и больше, жёлтые — 1–2, пустые — 0; пунктир — уровень 3.
-  function dayBars(r) {
-    var days = r.days || [], top = Math.max(3, isNum(r.max) ? r.max : 0);
+  function monthLabel(m) { return fDay(m.from) + '–' + fDay(m.to - 1); }
+  function rCls(x) { return x > 0 ? 'good' : (x < 0 ? 'bad' : ''); }
+  // Столбики итога по месяцам (блоки по 30 дней): вверх — в плюсе, вниз — в минусе; высота — итог в R.
+  function monthBars(months) {
+    var top = 1;
+    months.forEach(function (m) { if (Math.abs(m.sumR) > top) top = Math.abs(m.sumR); });
     var grid = h('div', {
-      class: 'daybars', role: 'img', style: 'grid-template-columns:repeat(' + Math.max(1, days.length) + ',minmax(0,1fr))',
-      'aria-label': 'Сигналов по дням: ' + days.map(function (d) { return fDay(d.t) + ' — ' + d.n; }).join(', ')
+      class: 'mbars', role: 'img', style: 'grid-template-columns:repeat(' + Math.max(1, months.length) + ',minmax(0,1fr))',
+      'aria-label': 'Итог по месяцам: ' + months.map(function (m) { return monthLabel(m) + ' ' + fR(m.sumR); }).join(', ')
     });
-    days.forEach(function (d) {
-      grid.appendChild(h('div', { class: 'db-col', title: fDay(d.t, true) + ': ' + d.n + ' ' + plural(d.n, 'сигнал', 'сигнала', 'сигналов') + ', входов ' + d.e },
-        h('div', { class: 'db-bar ' + (d.n >= 3 ? 'ok' : (d.n ? 'low' : 'zero')), style: d.n ? 'height:' + Math.max(4, Math.round(d.n / top * 100)) + '%' : null })));
+    months.forEach(function (m) {
+      var hgt = 'height:' + Math.max(4, Math.round(Math.abs(m.sumR) / top * 100)) + '%';
+      grid.appendChild(h('div', { class: 'mb-col', title: monthLabel(m) + ': сделок ' + m.n + ', итог ' + fR(m.sumR) },
+        h('div', { class: 'mb-up' }, m.sumR > 0 ? h('div', { class: 'mb-bar good', style: hgt }) : null),
+        h('div', { class: 'mb-down' }, m.sumR < 0 ? h('div', { class: 'mb-bar bad', style: hgt }) : null),
+        h('div', { class: 'mb-r ' + rCls(m.sumR) }, m.n ? fR(m.sumR) : '—'),
+        h('div', { class: 'mb-d' }, fDay(m.from))));
     });
-    var line = h('div', { class: 'db-line', style: 'bottom:' + (3 / top * 100).toFixed(1) + '%' }, h('span', null, '3'));
-    var rows = days.slice().reverse().map(function (d) {
-      return { cells: [fDay(d.t, true), { v: String(d.n), cls: d.n >= 3 ? 'good' : (d.n ? '' : 'muted') }, String(d.e)] };
-    });
-    return h('div', { class: 'daybars-box' },
-      h('div', { class: 'muted small' }, 'Сигналов за день: зелёные — 3 и больше, жёлтые — 1–2, пустые — ни одного'),
-      h('div', { class: 'daybars-wrap' }, grid, line),
-      h('div', { class: 'db-axis muted small' }, h('span', null, days.length ? fDay(days[0].t) : ''), h('span', null, days.length ? fDay(days[days.length - 1].t) : '')),
-      h('details', { class: 'db-details' }, h('summary', null, 'По дням: сигналы и входы'), tableWrap(mkTable(['День', 'Сигналов', 'Входов'], rows))));
+    return grid;
+  }
+  // Таблица по месяцам: perDay — сигналы в день (проверка live) или штуки (бэктест).
+  function monthTable(months, perDay) {
+    return tableWrap(mkTable(['Период', perDay ? 'Сигн./день' : 'Сигналов', 'Сделок', '✓ / ✗', 'Итог'], months.map(function (m) {
+      return {
+        cells: [monthLabel(m), perDay ? fN(m.signals / Math.max(1, m.days), 2) : String(m.signals), String(m.n),
+          m.n ? m.wins + ' / ' + m.losses : '—', { v: m.n ? fR(m.sumR) : '—', cls: rCls(m.sumR) }]
+      };
+    })));
   }
   function liveCheckCard() {
     var lc = App.lc, r = lc.res, body = [];
     var pids = App.activePresets();
-    body.push(h('p', { class: 'muted small' }, 'Прогон текущих настроек live по истории за ' + C.liveCheck.days + ' дней: те же detect() и validate(), что в live, по всем монетам списка и всем включённым пресетам (сейчас: ' +
-      pids.map(function (p) { return C.presets[p].short; }).join(', ') + '). Калибровку и результаты бэктеста не меняет.'));
+    body.push(h('p', { class: 'muted small' }, 'Прогон текущих настроек live по истории: те же detect() и validate(), что в live, по всем монетам списка и всем включённым пресетам (сейчас: ' +
+      pids.map(function (p) { return C.presets[p].short; }).join(', ') + '). Смотрите не только на общий итог, но и на месяцы: ровный результат важнее одного удачного месяца. Калибровку и результаты бэктеста проверка не меняет.'));
+    body.push(field('Период', seg(C.liveCheck.options.map(function (d) { return [d, d + ' дней']; }), lc.days, function (v) {
+      if (lc.running) return;
+      App.setLiveCheckDays(Number(v));
+      updateLiveCheck(true);
+    })));
     if (lc.running) {
       body.push(h('div', { class: 'progress' }, h('div', { class: 'bar', style: 'width:' + Math.round((lc.progress.frac || 0) * 100) + '%' })));
       body.push(h('div', { class: 'muted small', id: 'lc-progress-text' }, lc.progress.text || ''));
@@ -839,41 +856,45 @@ var UI = (function () {
     } else {
       body.push(h('div', { class: 'row-btns' },
         h('button', { type: 'button', class: 'btn primary', onclick: function () { App.runLiveCheck(); } }, r ? 'Проверить заново' : 'Проверить на истории'),
-        h('span', { class: 'muted small' }, 'история всех монет грузится несколько минут')));
+        h('span', { class: 'muted small' }, 'первый прогон долгий: грузится история всех монет, потом она берётся из кэша')));
     }
     if (lc.error) body.push(h('div', { class: 'note err' }, 'Проверка остановлена: ' + lc.error));
     if (r) {
       var rules = (r.presets || []).map(function (p, k) {
         return (r.modes && r.modes[k] && r.modes[k] !== r.snap.strategy) ? ' (' + C.presets[p].short + ' — по правилам «' + modeName(r.modes[k]) + '»)' : '';
       }).join('');
-      body.push(h('div', { class: 'note' }, 'Проверено ' + fDT(r.ts) + ' · история ' + fDate(r.fromT) + ' — ' + fDate(r.toT) + ' · профиль «' + modeName(r.snap.strategy) + '»' + rules +
+      body.push(h('div', { class: 'note' }, 'Проверено ' + fDT(r.ts) + ' · ' + r.period + ' дней: ' + fDate(r.fromT) + ' — ' + fDate(r.toT) + ' · профиль «' + modeName(r.snap.strategy) + '»' + rules +
         ' · пресеты: ' + (r.presets || []).map(function (p) { return C.presets[p].short; }).join(', ') + ' · монет ' + r.coins + ' · ожидание входа ' + r.snap.expiryBars + ' ' +
         plural(r.snap.expiryBars, 'свеча', 'свечи', 'свечей') + ' · minScore ' + r.snap.minScore + (r.snap.mode === 'long' ? ' · только LONG' : '') + ' · ' + r.source));
       if (App.liveCheckStale()) body.push(h('div', { class: 'note warn' }, 'Настройки live изменились после проверки: цифры ниже относятся к прежним настройкам. Запустите проверку заново.'));
+      var nm = r.months.length;
       body.push(h('div', { class: 'kv-grid' },
-        kv('Сигналов в день, в среднем', fN(r.avg, 1)),
-        kv('Дней с 3+ сигналами', r.ge3 + ' из ' + r.nDays, r.nDays && r.ge3 === r.nDays ? 'good' : ''),
-        kv('Дней без сигналов', String(r.zero)),
-        kv('Меньше всего / больше всего', (isNum(r.min) ? r.min : '—') + ' / ' + (isNum(r.max) ? r.max : '—')),
-        kv('Входов в день (лимит исполнился)', fN(r.avgEntries, 1)),
+        kv('Месяцев в плюсе', r.posMonths + ' из ' + nm, nm && r.posMonths === nm ? 'good' : (r.posMonths * 2 < nm ? 'bad' : '')),
+        kv('Итог', fR(r.sumR), rCls(r.sumR)),
         kv('Сделок за период', String(r.n)),
         kv('Успешных ✓', r.n ? r.wins + ' (' + fRate(r.winRate) + ')' : '—', 'good'),
         kv('Неуспешных ✗', r.n ? String(r.losses) : '—', 'bad'),
-        kv('Итог', fR(r.sumR), r.sumR > 0 ? 'good' : (r.sumR < 0 ? 'bad' : '')),
         kv('Profit factor', isNum(r.pf) ? fN(r.pf, 2) : (r.pfInf ? '∞' : '—')),
+        kv('Макс. просадка', fR(-r.maxDD)),
         kv('Итог при риске 1%', fPct(r.compPct) + ' (сложный процент)'),
-        kv('Контроль: последние 30%', r.outN + ' ' + plural(r.outN, 'сделка', 'сделки', 'сделок') + ', ' + fR(r.outSumR), r.outSumR > 0 ? 'good' : (r.outSumR < 0 ? 'bad' : ''))
+        kv('Сигналов в день, в среднем', fN(r.avg, 2)),
+        kv('Входов в день (лимит исполнился)', fN(r.avgEntries, 2)),
+        kv('Дней без сигналов', r.zero + ' из ' + r.nDays),
+        kv('Контроль: последние 30%', r.outN + ' ' + plural(r.outN, 'сделка', 'сделки', 'сделок') + ', ' + fR(r.outSumR), rCls(r.outSumR))
       ));
-      body.push(dayBars(r));
+      body.push(h('h4', { class: 'sub-title' }, 'По месяцам (блоки по 30 дней, справа — последний)'));
+      body.push(monthBars(r.months));
+      body.push(monthTable(r.months, true));
       if (r.n < C.backtest.minTrades) body.push(h('div', { class: 'note warn' }, 'Выборка мала, выводы ненадёжны (сделок: ' + r.n + ', нужно хотя бы ' + C.backtest.minTrades + ').'));
       (r.warnings || []).forEach(function (w) { body.push(h('div', { class: 'note warn' }, w)); });
       body.push(h('ul', { class: 'why-extra' }, [
-        h('li', null, 'По дням считаются только полные сутки по вашему времени (' + r.nDays + ' ' + plural(r.nDays, 'день', 'дня', 'дней') + '), сделки — за весь период.'),
+        h('li', null, 'Месяц — блок 30 дней от даты проверки назад. Если в половине месяцев минус, общий итог держится на одном-двух удачных отрезках.'),
+        h('li', null, 'Сигналы в день считаются по полным суткам по вашему времени (' + r.nDays + ' ' + plural(r.nDays, 'день', 'дня', 'дней') + '), сделки — за весь период.'),
         h('li', null, 'Пресеты прогоняются отдельно и объединяются по правилам live: по монете одновременно открыт один сигнал, пауза после SL общая. Это приближение к live, а не точная копия.'),
-        h('li', null, 'Прошлые дни не гарантируют будущих: число сигналов зависит от того, насколько активен рынок.')
+        h('li', null, 'Прошлые месяцы не гарантируют будущих.')
       ]));
     }
-    return h('div', { class: 'card', id: 'lc-card' }, h('h3', { class: 'card-title' }, 'Сигналов в день: проверка на истории'), body);
+    return h('div', { class: 'card', id: 'lc-card' }, h('h3', { class: 'card-title' }, 'Проверка на истории: сигналы и итог по месяцам'), body);
   }
   // Обновление карточки проверки: full — перестроить, иначе только полоса прогресса.
   function updateLiveCheck(full) {
@@ -902,36 +923,46 @@ var UI = (function () {
     var coinsInp = h('input', { type: 'text', class: 'inp', value: s.symbols.join(', '), autocapitalize: 'characters', spellcheck: 'false' });
     // Таймфреймы live-сигналов: один из пресетов или все три сразу.
     var pids = App.activePresets();
-    var liveSeg = seg([['main', C.presets.main.name], ['swing', C.presets.swing.name], ['scalp', C.presets.scalp.name], ['all', 'Все сразу']], s.livePreset, function (v) {
+    var qp = C.qualityPreset, qMulti = qp.presets.length > 1;
+    var liveOpts = [['main', C.presets.main.name], ['swing', C.presets.swing.name], ['scalp', C.presets.scalp.name], ['all', 'Все сразу']];
+    if (qMulti) liveOpts.push(['quality', 'Качественный набор']);
+    var liveSeg = seg(liveOpts, s.livePreset, function (v) {
       if (v === s.livePreset) return;
       App.updateSettings({ livePreset: v }, false);
-      toast('Таймфреймы live: ' + (v === 'all' ? 'все сразу' : C.presets[v].name) + ' — загружаю данные', 'good');
+      toast('Таймфреймы live: ' + App.livePresetName(v) + ' — загружаю данные', 'good');
       renderSettings();
     });
-    // Режим «3+ сигнала в день» — одной кнопкой: частый профиль, все пресеты, 30 монет, ожидание 96 свечей.
-    // Цифр здесь нет: сколько сигналов в день дают настройки, считает проверка на истории (карточка ниже).
-    var many = App.isManySignals(), mp = C.manySignalsPreset;
-    root.appendChild(section('Режим «3+ сигнала в день»', [
-      h('p', { class: 'muted small' }, 'Частый профиль (на скальпе — мягкие правила), все пресеты сразу, ' + C.extendedSymbols.length + ' монет, ожидание входа ' + mp.expiryBars + ' свечей, minScore ' + mp.minScore + '.'),
+    // Качественный режим — одной кнопкой; состав — CONFIG.qualityPreset (те же сигналы присылает Telegram-бот).
+    // Цифр здесь нет: как режим ведёт себя по месяцам, считает проверка на истории (карточка ниже).
+    var qOn = App.isQuality();
+    var qWait = qp.presets.map(function (p) { return C.presets[p].short + ' — ' + hoursText(qp.expiryBars, C.presets[p].ltf); }).join(', ');
+    root.appendChild(section('Качественный режим', [
+      h('p', { class: 'muted small' }, 'Профиль «' + modeName(qp.strategy) + '», ' + qp.presets.map(function (p) { return C.presets[p].name; }).join(' + ') + ', ' +
+        qp.symbols.length + ' монет, ожидание входа ' + qp.expiryBars + ' ' + plural(qp.expiryBars, 'свеча', 'свечи', 'свечей') + ' младшего ТФ (' + qWait + '), minScore ' + qp.minScore + '.'),
       h('ul', { class: 'why-extra' }, [
-        h('li', null, 'Гарантии «каждый день» нет: сетапы появляются, когда их даёт рынок. В спокойные дни сигналов меньше трёх, в активные — больше.'),
-        h('li', null, 'Сколько сигналов в день выходит на ваших монетах и чем закончились сделки, покажет проверка ниже. Её цифры считает приложение по свежей истории.'),
-        h('li', null, 'Каждый сигнал слабее, чем в строгом и мягком профиле. Монеты двигаются вместе: не открывайте больше 2–3 сделок одновременно.')
+        h('li', null, 'Лучший из проверенных вариантов, но преимущество небольшое, а сделок на истории мало. Состав выбран правилом, заданным до проверки.'),
+        h('li', null, 'Сигналов немного. Добрать их без потери качества не получилось: на истории не держались ни ослабленные правила (частый профиль), ни новые монеты (широкий список).'),
+        h('li', null, 'Как режим ведёт себя по месяцам, покажет проверка ниже: её цифры считает приложение.'),
+        h('li', null, 'Сначала проверьте режим 2–4 недели без реальных денег: журнал сигналов и Telegram-бот считают результат сами.'),
+        h('li', null, 'Те же сигналы может присылать Telegram-бот с GitHub. Инструкция — в репозитории, файл bot/НАСТРОЙКА.md.')
       ]),
-      h('div', { class: 'row-btns' }, many
+      h('div', { class: 'row-btns' }, qOn
         ? h('span', { class: 'chip good' }, 'Режим включён')
-        : h('button', { type: 'button', class: 'btn primary', onclick: function () { App.applyManySignals(); toast('Режим «3+ сигнала в день» включён — загружаю ' + C.extendedSymbols.length + ' монет', 'good'); renderSettings(); } }, 'Включить режим'))
+        : h('button', { type: 'button', class: 'btn primary', onclick: function () { App.applyQuality(); toast('Качественный режим включён — загружаю ' + qp.symbols.length + ' монет', 'good'); renderSettings(); } }, 'Включить качественный режим'))
     ]));
     root.appendChild(liveCheckCard());
+    var liveHints = [
+      h('li', null, 'Основной 4H/1H/15m — как в промпте: тренд 4H, зона 1H, вход 15m. Сделки длятся часы и дни.'),
+      h('li', null, 'Свинг 1D/4H/1H — сигналов меньше, сделки дольше (дни), стопы шире.'),
+      h('li', null, 'Скальп 1H/15m/5m — сигналов больше, сделки короче (часы), стопы уже; откаты есть даже при сильном тренде.'),
+      h('li', null, 'Все сразу — три пресета параллельно, данных и запросов больше. По одной монете одновременно открыт только один сигнал (первым проверяется основной пресет).')
+    ];
+    if (qMulti) liveHints.push(h('li', null, 'Качественный набор — пресеты качественного режима: ' + qp.presets.map(function (p) { return C.presets[p].short; }).join(' + ') + '.'));
     root.appendChild(section('Таймфреймы live-сигналов', [
       liveSeg,
-      h('ul', { class: 'why-extra' }, [
-        h('li', null, 'Основной 4H/1H/15m — как в промпте: тренд 4H, зона 1H, вход 15m. Сделки длятся часы и дни.'),
-        h('li', null, 'Свинг 1D/4H/1H — сигналов меньше, сделки дольше (дни), стопы шире.'),
-        h('li', null, 'Скальп 1H/15m/5m — сигналов больше, сделки короче (часы), стопы уже; откаты есть даже при сильном тренде.'),
-        h('li', null, 'Все сразу — три пресета параллельно, данных и запросов больше. По одной монете одновременно открыт только один сигнал (первым проверяется основной пресет).'),
+      h('ul', { class: 'why-extra' }, liveHints.concat([
         h('li', null, 'Правила стратегии одинаковые, отличаются только таймфреймы. Проверить каждый пресет можно в бэктесте; калибровка точности ведётся для каждого пресета отдельно.')
-      ])
+      ]))
     ]));
     var modeSeg = seg([['strict', 'Строгий (по промпту)'], ['soft', 'Мягкий'], ['frequent', 'Частый']], s.strategy, function (v) {
       if (v === s.strategy) return;
@@ -942,7 +973,7 @@ var UI = (function () {
     var modeHints = {
       strict: [
         'Все условия промпта обязательны: тренд старшего ТФ, вход из Discount/Premium его диапазона, свежая зона среднего ТФ, sweep, CHoCH/BOS с displacement на младшем.',
-        'Сигналов очень мало, зато каждый — полный сетап. Сколько их выходит на ваших монетах, покажет проверка «Сигналов в день» выше.'
+        'Сигналов очень мало, зато каждый — полный сетап. Сколько их выходит на ваших монетах, покажет проверка на истории выше.'
       ],
       soft: [
         'Sweep ликвидности не обязателен: если он был, даёт +' + C.weights.sweep + ' к score, если нет — сигнал всё равно возможен.',
@@ -954,7 +985,8 @@ var UI = (function () {
         'Всё из мягкого, плюс: зона среднего ТФ желательна (+ до ' + C.weights.zoneObFvg + ' баллов), но не обязательна; если есть — может быть дальше, до 1×ATR.',
         'Импульс на слом слабее: тело от 1.2×ATR (пара свечей — от 1.6×ATR) вместо 1.5 и 2.0.',
         'Место для хода от 2.5R вместо 3R.',
-        'Остаются: тренд старшего ТФ, Premium/Discount, CHoCH/BOS, риск 0.25–3%, minScore и двойная проверка. Сигналов больше, но каждый слабее — смотрите бэктест.',
+        'Остаются: тренд старшего ТФ, Premium/Discount, CHoCH/BOS, риск 0.25–3%, minScore и двойная проверка.',
+        'Сигналов больше, но на длинной истории частый профиль терял: удачный месяц сменялся убыточными. Для входа в сделки его лучше не использовать — проверьте сами на 90 и 180 днях.',
         'На скальпе (5m) частый профиль работает по мягким правилам: ослабленные фильтры на 5m дают слишком много шума.'
       ]
     };
@@ -994,8 +1026,9 @@ var UI = (function () {
       h('div', { class: 'row-btns' },
         h('button', { type: 'button', class: 'btn primary', onclick: function () { App.setCoins(coinsInp.value); } }, 'Применить'),
         h('button', { type: 'button', class: 'btn', onclick: function () { coinsInp.value = C.symbols.join(', '); App.setCoins(coinsInp.value); } }, 'По умолчанию (10)'),
-        h('button', { type: 'button', class: 'btn', onclick: function () { coinsInp.value = C.extendedSymbols.join(', '); App.setCoins(coinsInp.value); } }, 'Расширенный (30)')),
-      h('div', { class: 'muted small' }, 'Больше монет — больше сигналов при тех же правилах. До ' + C.maxSymbols + ' монет. Монеты двигаются вместе, поэтому сигналы часто приходят пачкой.')
+        h('button', { type: 'button', class: 'btn', onclick: function () { coinsInp.value = C.extendedSymbols.join(', '); App.setCoins(coinsInp.value); } }, 'Расширенный (' + C.extendedSymbols.length + ')'),
+        h('button', { type: 'button', class: 'btn', onclick: function () { coinsInp.value = C.wideSymbols.join(', '); App.setCoins(coinsInp.value); } }, 'Широкий (' + C.wideSymbols.length + ')')),
+      h('div', { class: 'muted small' }, 'Больше монет — больше сигналов при тех же правилах, но не обязательно лучше: на монетах, добавленных в широкий список, мягкий профиль на истории терял — проверьте сами на 180 днях. До ' + C.maxSymbols + ' монет. Монеты двигаются вместе, поэтому сигналы часто приходят пачкой.')
     ]));
     var snd = h('input', { type: 'checkbox', checked: s.sound, onchange: function (e) { App.updateSettings({ sound: e.target.checked }, false); } });
     var perm = App.notifyPermission();

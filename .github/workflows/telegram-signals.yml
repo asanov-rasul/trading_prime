@@ -1,0 +1,62 @@
+# SMC Signals — Telegram-бот сигналов. Примерно раз в 10 минут проверяет рынок теми же правилами, что и
+# приложение (CONFIG.qualityPreset в js/config.js), и присылает в Telegram новые сигналы и события по ним.
+# Секреты репозитория: TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID (настройка — bot/НАСТРОЙКА.md).
+# Состояние бота хранится в отдельной ветке bot-state (state.json, status.json) — без секретов и chat id.
+name: Telegram-сигналы
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'bot/**'
+      - 'js/**'
+      - '.github/workflows/telegram-signals.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: telegram-signals
+  cancel-in-progress: false
+
+jobs:
+  signals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Код приложения и бота
+        uses: actions/checkout@v4
+
+      - name: Состояние бота (ветка bot-state)
+        run: |
+          if git ls-remote --exit-code --heads origin bot-state > /dev/null 2>&1; then
+            git fetch --depth=1 origin bot-state
+            git worktree add -B bot-state state FETCH_HEAD
+          else
+            git worktree add --detach state
+            git -C state switch --orphan bot-state
+          fi
+
+      - name: Проверка рынка и уведомления
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          node --version
+          node bot/run.js --state state
+
+      - name: Сохранить состояние
+        if: always()
+        run: |
+          cd state || exit 0
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Состояние не изменилось."
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet -m "Состояние бота $(date -u '+%Y-%m-%d %H:%M') UTC"
+          git push --quiet origin HEAD:bot-state

@@ -22,7 +22,8 @@ var App = (function () {
     };
   }
   // Таймфреймы live-сигналов: один пресет или все три сразу.
-  var LIVE_PRESETS = ['main', 'swing', 'scalp', 'all'];
+  // 'quality' — набор пресетов качественного режима (CONFIG.qualityPreset.presets), если он из нескольких пресетов.
+  var LIVE_PRESETS = ['main', 'swing', 'scalp', 'all', 'quality'];
   function numIn(v, lo, hi, def) { return (typeof v === 'number' && isFinite(v) && v >= lo && v <= hi) ? v : def; }
   function sanitize(s) {
     var d = defaults(), o = {};
@@ -46,7 +47,13 @@ var App = (function () {
   // Окно догрузки при старте: сигнал старше срока ожидания входа уже не может ждать вход.
   function catchUpBars() { return Math.max(C.live.catchUpBars, app.settings.expiryBars); }
   // Активные пресеты live-режима. «Все сразу» — основной, свинг и скальп параллельно (основной первым).
-  function activePresets() { return app.settings.livePreset === 'all' ? ['main', 'swing', 'scalp'] : [app.settings.livePreset]; }
+  function activePresets() {
+    var v = app.settings.livePreset;
+    if (v === 'all') return ['main', 'swing', 'scalp'];
+    if (v === 'quality') return C.qualityPreset.presets.slice();
+    return [v];
+  }
+  function livePresetName(v) { return v === 'all' ? 'все пресеты сразу' : (v === 'quality' ? 'качественный набор' : C.presets[v].name); }
   function primaryPreset() { return activePresets()[0]; }
   // Сколько свечей держать по роли ТФ: младший — окно + догрузка; средний — окно и 30 дней для оценки
   // волатильности; старший — окно и прогрев EMA200.
@@ -484,7 +491,7 @@ var App = (function () {
     var bt = app.bt, p = bt.params;
     if (bt.running) return;
     if (!feed || !feed.adapter || !feed.coins.length) { UI.toast('Нет подключения к источнику данных', 'bad'); return; }
-    if (app.lc && app.lc.running) { UI.toast('Идёт проверка «Сигналов в день» — дождитесь её окончания', 'bad'); return; }
+    if (app.lc && app.lc.running) { UI.toast('Идёт проверка на истории в Настройках — дождитесь её окончания', 'bad'); return; }
     if (!(p.minScore >= 60 && p.minScore <= 100)) p.minScore = app.settings.minScore;
     if (!(p.feePct >= 0)) p.feePct = marketFee();
     if (!(p.slipPct >= 0)) p.slipPct = app.settings.slipPct;
@@ -531,9 +538,12 @@ var App = (function () {
   }
   function lcDefaults() {
     var saved = Store.get(C.storage.liveCheck, null);
-    var ok = saved && saved.v === 1 && Array.isArray(saved.days) && saved.snap && typeof saved.ts === 'number';
-    return { running: false, cancel: false, progress: { frac: 0, text: '' }, res: ok ? saved : null, error: '' };
+    var ok = saved && saved.v === 2 && Array.isArray(saved.days) && Array.isArray(saved.months) && saved.snap && typeof saved.ts === 'number';
+    var days = ok && C.liveCheck.options.indexOf(saved.period) >= 0 ? saved.period : C.liveCheck.days;
+    return { running: false, cancel: false, progress: { frac: 0, text: '' }, res: ok ? saved : null, error: '', days: days };
   }
+  // Период проверки: 90 или 180 дней.
+  app.setLiveCheckDays = function (d) { if (C.liveCheck.options.indexOf(d) >= 0 && !app.lc.running) app.lc.days = d; };
   function numOrNull(x) { return (typeof x === 'number' && isFinite(x)) ? x : null; }
   // Настройки live изменились после последней проверки — её цифры относятся к другим настройкам.
   app.liveCheckStale = function () {
@@ -545,7 +555,8 @@ var App = (function () {
     if (lc.running) return;
     if (!feed || !feed.adapter || !feed.coins.length || !app.ready) { UI.toast('Данные ещё загружаются — запустите проверку чуть позже', 'bad'); return; }
     if (app.bt.running || Backtest.isRunning()) { UI.toast('Идёт бэктест — дождитесь его окончания', 'bad'); return; }
-    var pids = activePresets(), coins = feed.coins.slice(), snap = lcSnapshot(), days = C.liveCheck.days;
+    var pids = activePresets(), coins = feed.coins.slice(), snap = lcSnapshot();
+    var days = C.liveCheck.options.indexOf(lc.days) >= 0 ? lc.days : C.liveCheck.days;
     var base = {
       adapter: feed.adapter, base: feed.base, coins: coins, hasBtc: feed.hasBtc, days: days,
       minScore: app.settings.minScore, feePct: marketFee(), slipPct: app.settings.slipPct,
@@ -554,7 +565,7 @@ var App = (function () {
     var results = [], k = 0;
     lc.running = true; lc.cancel = false; lc.error = ''; lc.progress = { frac: 0, text: 'Старт…' };
     UI.updateLiveCheck(true);
-    log('info', 'Проверка «Сигналов в день»: ' + days + ' дн, пресеты ' + pids.map(function (p) { return C.presets[p].short; }).join(' + ') +
+    log('info', 'Проверка на истории: ' + days + ' дн, пресеты ' + pids.map(function (p) { return C.presets[p].short; }).join(' + ') +
       ', профиль «' + C.strategyModes[snap.strategy].name + '», монет ' + coins.length + ', ожидание ' + snap.expiryBars + ' свечей, minScore ' + snap.minScore);
     function next() {
       if (lc.cancel) return Promise.reject(new Error('отменено'));
@@ -579,7 +590,11 @@ var App = (function () {
         r.meta.coins.forEach(function (c) { covered[c] = true; });
       });
       lc.res = {
-        v: 1, ts: Date.now(), snap: snap, fromT: fromT, toT: toT, presets: pids, source: feed.adapter.name,
+        v: 2, ts: Date.now(), period: days, snap: snap, fromT: fromT, toT: toT, presets: pids, source: feed.adapter.name,
+        months: sum.months.map(function (m) {
+          return { from: m.from, to: m.to, days: m.days, signals: m.signals, entries: m.entries, n: m.n, wins: m.wins, losses: m.losses, sumR: m.sumR, pf: numOrNull(m.pf), pfInf: m.pf === Infinity };
+        }),
+        posMonths: sum.posMonths,
         modes: pids.map(function (p) { return profileFor(snap.strategy, p); }), coins: Object.keys(covered).length,
         days: sum.days, nDays: sum.nDays, avg: numOrNull(sum.avg), avgEntries: numOrNull(sum.avgEntries),
         ge3: sum.ge3, zero: sum.zero, min: numOrNull(sum.min), max: numOrNull(sum.max),
@@ -589,13 +604,13 @@ var App = (function () {
       };
       Store.set(C.storage.liveCheck, lc.res);
       lc.running = false; lc.progress = { frac: 1, text: '' };
-      log('info', 'Проверка «Сигналов в день» завершена: в среднем ' + (lc.res.avg === null ? '—' : lc.res.avg.toFixed(1)) +
-        ' в день, 3 и больше — ' + sum.ge3 + ' из ' + sum.nDays + ' дней, сделок ' + st.n + ', итог ' + st.sumR.toFixed(2) + 'R');
+      log('info', 'Проверка на истории (' + days + ' дн) завершена: в среднем ' + (lc.res.avg === null ? '—' : lc.res.avg.toFixed(1)) +
+        ' сигнала в день, сделок ' + st.n + ', итог ' + st.sumR.toFixed(2) + 'R, месяцев в плюсе ' + sum.posMonths + ' из ' + sum.months.length);
       UI.toast('Проверка на истории завершена', 'good');
       UI.updateLiveCheck(true);
     }).then(null, function (e) {
       lc.running = false; lc.error = e.message || String(e); lc.progress = { frac: 0, text: '' };
-      log('warn', 'Проверка «Сигналов в день» остановлена: ' + lc.error);
+      log('warn', 'Проверка на истории остановлена: ' + lc.error);
       UI.updateLiveCheck(true);
     });
   };
@@ -634,8 +649,9 @@ var App = (function () {
     }
     if (app.settings.livePreset !== prevLive) {
       // Другие таймфреймы — другой набор данных: перезапуск ленты и догрузка по новым пресетам.
-      log('info', 'Таймфреймы live: ' + (app.settings.livePreset === 'all' ? 'все пресеты сразу' : C.presets[app.settings.livePreset].name));
-      if (app.settings.livePreset !== 'all') app.bt.params.presetId = app.settings.livePreset;
+      log('info', 'Таймфреймы live: ' + livePresetName(app.settings.livePreset));
+      if (C.presets[app.settings.livePreset]) app.bt.params.presetId = app.settings.livePreset;
+      else if (app.settings.livePreset === 'quality') app.bt.params.presetId = C.qualityPreset.presets[0];
       restart = true;
     }
     if (restart) { restartFeed(); return; }
@@ -645,15 +661,20 @@ var App = (function () {
       else updateOverviews();
     }
   };
-  // Режим «3+ сигнала в день»: частый профиль, все пресеты сразу, ожидание 96 свечей, minScore 60, 30 монет.
-  app.applyManySignals = function () {
-    var p = C.manySignalsPreset;
-    log('info', 'Включён режим «3+ сигнала в день»: профиль частый, все пресеты, 30 монет');
-    app.updateSettings({ strategy: p.strategy, livePreset: p.livePreset, expiryBars: p.expiryBars, minScore: p.minScore, symbols: C.extendedSymbols.slice() }, true);
+  // Качественный режим: профиль, пресеты, ожидание входа, minScore и монеты — из CONFIG.qualityPreset
+  // (его же использует Telegram-бот, поэтому бот и приложение выдают одни и те же сигналы).
+  function qualityLive() { var p = C.qualityPreset.presets; return p.length === 1 ? p[0] : 'quality'; }
+  app.livePresetName = livePresetName;
+  app.applyQuality = function () {
+    var q = C.qualityPreset;
+    log('info', 'Включён качественный режим: профиль «' + C.strategyModes[q.strategy].name + '», ' +
+      q.presets.map(function (p) { return C.presets[p].short; }).join(' + ') + ', монет ' + q.symbols.length + ', ожидание ' + q.expiryBars + ' свечей, minScore ' + q.minScore);
+    app.updateSettings({ strategy: q.strategy, livePreset: qualityLive(), expiryBars: q.expiryBars, minScore: q.minScore, symbols: q.symbols.slice() }, true);
   };
-  app.isManySignals = function () {
-    var p = C.manySignalsPreset, s = app.settings;
-    return s.strategy === p.strategy && s.livePreset === p.livePreset && s.symbols.length >= C.extendedSymbols.length;
+  app.isQuality = function () {
+    var q = C.qualityPreset, s = app.settings;
+    return s.strategy === q.strategy && s.livePreset === qualityLive() && s.expiryBars === q.expiryBars && s.minScore === q.minScore &&
+      s.symbols.length === q.symbols.length && q.symbols.every(function (c) { return s.symbols.indexOf(c) >= 0; });
   };
   app.setCoins = function (text) {
     var list = String(text || '').toUpperCase().split(/[\s,;]+/).map(function (x) {
@@ -885,7 +906,17 @@ var App = (function () {
       var sm = Backtest.liveSummary(kept, b0, b0 + 2 * D);
       var merge = ids === 'Amain1,Bmain2,Ascalp5,Aswing30' && days.length === 2 && days[0].n === 3 && days[0].e === 2 && days[1].n === 1 &&
         part.length === 1 && part[0].n === 1 && sm.ge3 === 1 && sm.zero === 0 && sm.avg === 2 && sm.min === 1 && sm.max === 3;
-      return profiles && plan && merge;
+      // Месяцы — блоки по 30 дней от конца; хвост короче недели присоединяется к самому раннему блоку.
+      var m65 = Backtest.monthBlocks([], 0, 65 * D), m90 = Backtest.monthBlocks([], 0, 90 * D);
+      var months = sm.months.length === 1 && sm.months[0].signals === 4 && sm.posMonths === 0 &&
+        m65.length === 2 && m65[0].days === 35 && m65[1].days === 30 && m90.length === 3 && m90.every(function (m) { return m.days === 30; });
+      // Качественный режим: список монет раскрыт в массив, без TON, все монеты есть в широком списке.
+      var q = CONFIG.qualityPreset;
+      var quality = Array.isArray(q.symbols) && q.symbols.length > 0 && q.symbols.indexOf('TON') < 0 &&
+        q.symbols.every(function (c) { return CONFIG.wideSymbols.indexOf(c) >= 0; }) && CONFIG.wideSymbols.length <= CONFIG.maxSymbols &&
+        q.presets.every(function (p) { return !!CONFIG.presets[p]; }) && !!CONFIG.strategyModes[q.strategy] &&
+        CONFIG.lifecycle.expiryOptions.indexOf(q.expiryBars) >= 0;
+      return profiles && plan && merge && months && quality;
     });
     test('Сглаживание точности: (успехи + 10p) / (n + 10)', function () {
       return Math.abs(Signals.smooth(10, 20, 0.5, 10) - 0.5) < 1e-12 && Math.abs(Signals.smooth(18, 20, 0.5, 10) - 23 / 30) < 1e-12 &&

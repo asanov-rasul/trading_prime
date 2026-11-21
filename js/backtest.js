@@ -249,7 +249,26 @@ var Backtest = (function () {
       inS: Signals.stats(all.filter(function (x) { return x.createdT < splitT; })),
       outS: Signals.stats(all.filter(function (x) { return x.createdT >= splitT; }))
     };
-    return { meta: meta, signals: all, summary: summary, byCoin: byCoin, byBucket: byBucket, split: split };
+    return { meta: meta, signals: all, summary: summary, byCoin: byCoin, byBucket: byBucket, split: split, byMonth: monthBlocks(all, meta.startT, meta.endT) };
+  }
+
+  // Итоги по «месяцам» — блокам по 30 дней от конца периода к началу (последний блок самый свежий и полный).
+  // Хвост короче недели присоединяется к самому раннему блоку. Показывает, ровный ли результат во времени.
+  function monthBlocks(list, fromT, toT) {
+    var bounds = [], end = toT;
+    while (end - fromT > DAY / 2 && bounds.length < 24) {
+      var start = end - 30 * DAY;
+      if (start - fromT < 7 * DAY) start = fromT;
+      bounds.unshift([start, end]);
+      end = start;
+    }
+    return bounds.map(function (b) {
+      var st = Signals.stats(list.filter(function (s) { return s.createdT >= b[0] && s.createdT < b[1]; }));
+      return {
+        from: b[0], to: b[1], days: (b[1] - b[0]) / DAY, signals: st.signals, entries: st.entries,
+        n: st.n, wins: st.wins, losses: st.losses, sumR: st.sumR, pf: st.pf
+      };
+    });
   }
 
   // ---------- проверка live-настроек: несколько пресетов вместе ----------
@@ -309,7 +328,8 @@ var Backtest = (function () {
     return {
       days: days.map(function (x) { return { t: x.t, n: x.n, e: x.e }; }), nDays: nd,
       avg: nd ? sumN / nd : NaN, avgEntries: nd ? sumE / nd : NaN, ge3: ge3, zero: zero,
-      min: nd ? min : NaN, max: nd ? max : NaN, summary: agg.summary, split: agg.split
+      min: nd ? min : NaN, max: nd ? max : NaN, summary: agg.summary, split: agg.split,
+      months: agg.byMonth, posMonths: agg.byMonth.filter(function (m) { return m.sumR > 0; }).length
     };
   }
 
@@ -354,6 +374,6 @@ var Backtest = (function () {
 
   return {
     run: run, cancel: cancel, isRunning: isRunning, toCSV: toCSV, aggregate: aggregate, FUNNEL: FUNNEL,
-    mergeLive: mergeLive, countByDay: countByDay, liveSummary: liveSummary
+    mergeLive: mergeLive, countByDay: countByDay, liveSummary: liveSummary, monthBlocks: monthBlocks
   };
 })();
