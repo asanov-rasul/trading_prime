@@ -4,13 +4,18 @@
 
 var CONFIG = (function () {
   var cfg = {
-    version: '1.0.0',
+    version: '1.4.0',
 
     // Монеты (пары к USDT, без стейблкоинов). Первые восемь — крупнейшие не-стейблкоины по капитализации
     // на 16.11.2026 (Coinfomania по данным CoinMarketCap); DOGE и ADA — популярные ликвидные монеты.
     symbols: ['BTC', 'ETH', 'BNB', 'XRP', 'SOL', 'TRX', 'HYPE', 'ZEC', 'DOGE', 'ADA'],
     // Запасные монеты на случай, если пары нет на источнике.
     reserveSymbols: ['LINK', 'AVAX', 'SUI', 'LTC'],
+    // Расширенный список (30 ликвидных пар) — больше рынков, больше сигналов при тех же правилах.
+    extendedSymbols: ['BTC', 'ETH', 'BNB', 'XRP', 'SOL', 'TRX', 'HYPE', 'ZEC', 'DOGE', 'ADA',
+      'LINK', 'AVAX', 'SUI', 'LTC', 'DOT', 'BCH', 'NEAR', 'APT', 'UNI', 'AAVE',
+      'XLM', 'HBAR', 'ETC', 'TON', 'FIL', 'ATOM', 'ARB', 'OP', 'INJ', 'WLD'],
+    maxSymbols: 30,
     quote: 'USDT',
     btcCoin: 'BTC',
 
@@ -19,9 +24,9 @@ var CONFIG = (function () {
 
     // Пресеты бэктеста.
     presets: {
-      main: { id: 'main', name: 'Основной 4H/1H/15m', htf: '4h', mtf: '1h', ltf: '15m' },
-      swing: { id: 'swing', name: 'Свинг 1D/4H/1H', htf: '1d', mtf: '4h', ltf: '1h' },
-      scalp: { id: 'scalp', name: 'Скальп 1H/15m/5m', htf: '1h', mtf: '15m', ltf: '5m' }
+      main: { id: 'main', name: 'Основной 4H/1H/15m', short: 'основной', htf: '4h', mtf: '1h', ltf: '15m' },
+      swing: { id: 'swing', name: 'Свинг 1D/4H/1H', short: 'свинг', htf: '1d', mtf: '4h', ltf: '1h' },
+      scalp: { id: 'scalp', name: 'Скальп 1H/15m/5m', short: 'скальп', htf: '1h', mtf: '15m', ltf: '5m' }
     },
     defaultPreset: 'main',
 
@@ -58,8 +63,8 @@ var CONFIG = (function () {
     // FVG.
     fvg: { minAtr: 0.1, maxFill: 0.5 },
 
-    // Зона интереса 1H: цена внутри или не дальше 0.5×ATR(1H).
-    poi: { maxDistAtr: 0.5 },
+    // Зона интереса 1H: цена внутри или не дальше 0.5×ATR(1H). optional — зона даёт баллы, но не обязательна.
+    poi: { maxDistAtr: 0.5, optional: false },
 
     // OTE.
     ote: { lo: 0.62, hi: 0.79 },
@@ -81,9 +86,13 @@ var CONFIG = (function () {
 
     // Жизненный цикл сигнала.
     lifecycle: {
-      expiryBars: 12,                // вход не случился за 12 свечей 15m → просрочен
+      expiryBars: 12,                // вход не случился за 12 свечей 15m → просрочен (по промпту)
+      expiryOptions: [12, 24, 48, 96], // варианты настройки «Ожидание входа»: 3, 6, 12, 24 ч на 15m
       cooldownBars: 8,               // пауза после SL
-      cancelIfTp1BeforeEntry: false  // true — отменять ожидающий вход, если цена дошла до TP1 раньше входа
+      cancelIfTp1BeforeEntry: false, // true — отменять ожидающий вход, если цена дошла до TP1 раньше входа
+      // true — отменять ожидающий вход, если цена дошла до TP3 раньше входа. Выключено: на истории основного
+      // пресета это убирало большинство прибыльных поздних входов (12 сделок → 3, +2.4R → −0.47R за 180 дней).
+      cancelIfTp3BeforeEntry: false
     },
 
     // Валидатор. Правило «цена уже прошла TP1»:
@@ -94,6 +103,37 @@ var CONFIG = (function () {
 
     // Обязательные условия сценария входа.
     require: { sweep: true, displacement: true },
+
+    // Диапазон Premium/Discount: 'htf' — от swing low до swing high на 4H (по промпту), 'mtf' — на 1H.
+    pdRange: 'htf',
+
+    // Профили стратегии. strict — строго по промпту. soft — ослабленный профиль, заданный заранее
+    // (параметры не подбирались по истории):
+    //  1) sweep не обязателен — как в таблице score, где он фактор на 15 баллов, а не обязательное условие;
+    //  2) Premium/Discount по диапазону 1H (откат внутри тренда 4H), а не по большому диапазону 4H;
+    //  3) вход у ближней к цене границы зоны (entryMode 'edge') — его чаще достигает ретест.
+    // Остальные правила (тренд 4H, свежая зона 1H, CHoCH/BOS с displacement, риск, 3R, валидатор) те же.
+    // frequent — для частых сигналов, тоже задан заранее: всё из мягкого, плюс
+    //  4) зона среднего ТФ желательна (+баллы за качество зоны), но не обязательна, и допускается дальше — до 1×ATR;
+    //  5) импульс слабее: тело от 1.2×ATR (пара свечей — от 1.6×ATR);
+    //  6) место для хода от 2.5R (TP3 всё равно дальше TP2).
+    // Тренд старшего ТФ, Premium/Discount, слом CHoCH/BOS, риск 0.25–3% и двойная проверка остаются.
+    defaultStrategy: 'strict',
+    strategyModes: {
+      strict: { name: 'Строгий (по промпту)', short: 'строгий' },
+      soft: { name: 'Мягкий', short: 'мягкий', require: { sweep: false }, pdRange: 'mtf', entryMode: 'edge' },
+      frequent: {
+        name: 'Частый', short: 'частый', require: { sweep: false }, pdRange: 'mtf', entryMode: 'edge',
+        poi: { optional: true, maxDistAtr: 1.0 }, displacement: { single: 1.2, double: 1.6 }, tp: { tp3MinR: 2.5 }
+      }
+    },
+    // Профиль по пресету: в частом профиле скальп работает по мягким правилам. На 5m ослабленные фильтры дают
+    // слишком много шума: 30 монет × 30 дней — частый на скальпе −15.6R (контроль −11.6R), мягкий +2.2R.
+    profileByPreset: { frequent: { scalp: 'soft' } },
+    // Режим «3+ сигнала в день». Выбран по истории 21.10–20.11 (30 монет): 3.7 сигнала в день, 3 и больше —
+    // в 18 днях из 30, 68 сделок, +14.6R; на контрольных 30% — +11.8R. В интерфейсе цифр нет: их считает
+    // проверка «Сигналов в день» (App.runLiveCheck) по свежей истории.
+    manySignalsPreset: { strategy: 'frequent', livePreset: 'all', expiryBars: 96, minScore: 60 },
 
     // Веса score (сумма максимумов = 100).
     weights: {
@@ -125,7 +165,8 @@ var CONFIG = (function () {
       backoffMaxMs: 60000,
       banPauseMs: 120000,          // код 418
       closeGraceMs: 3000,          // свеча считается закрытой через 3 с после окончания
-      failCyclesToSwitch: 3        // столько неудачных циклов подряд → следующий источник
+      failCyclesToSwitch: 3,       // столько неудачных циклов подряд → следующий источник
+      preferProbeMs: 600000        // раз в 10 мин проверять, вернулся ли приоритетный источник
     },
 
     // Источники данных в порядке автопереключения.
@@ -152,6 +193,9 @@ var CONFIG = (function () {
       minTrades: 30
     },
 
+    // Проверка текущих настроек live на истории: сколько сигналов в день (Настройки → «Сигналов в день»).
+    liveCheck: { days: 30 },
+
     // Калькулятор.
     calculator: {
       deposit: 100,
@@ -169,6 +213,7 @@ var CONFIG = (function () {
       calib: 'smc.calib.v1',
       log: 'smc.log.v1',
       presets: 'smc.presetcmp.v1',
+      liveCheck: 'smc.livecheck.v1',
       idbName: 'smc-signals-cache',
       idbStore: 'candles'
     },
@@ -186,3 +231,47 @@ var CONFIG = (function () {
   }
   return deepFreeze(cfg);
 })();
+
+// Эффективные параметры профиля стратегии: CONFIG + переопределения из CONFIG.strategyModes[mode].
+// Детектор, валидатор и бэктест получают этот объект — одни и те же функции для live и истории.
+var configFor = (function () {
+  var cache = {};
+  function clone(v) {
+    if (Array.isArray(v)) return v.map(clone);
+    if (v && typeof v === 'object') {
+      var o = {};
+      Object.keys(v).forEach(function (k) { o[k] = clone(v[k]); });
+      return o;
+    }
+    return v;
+  }
+  function merge(dst, src) {
+    Object.keys(src).forEach(function (k) {
+      if (k === 'name' || k === 'short') return;
+      var s = src[k];
+      if (s && typeof s === 'object' && !Array.isArray(s) && dst[k] && typeof dst[k] === 'object') merge(dst[k], s);
+      else dst[k] = clone(s);
+    });
+    return dst;
+  }
+  function freeze(o) {
+    Object.keys(o).forEach(function (k) { if (o[k] && typeof o[k] === 'object') freeze(o[k]); });
+    return Object.freeze(o);
+  }
+  return function (mode) {
+    var m = CONFIG.strategyModes[mode] ? mode : CONFIG.defaultStrategy;
+    if (!cache[m]) {
+      var o = merge(clone(CONFIG), CONFIG.strategyModes[m]);
+      o.strategy = m;
+      cache[m] = freeze(o);
+    }
+    return cache[m];
+  };
+})();
+
+// Фактический профиль для пресета: выбранный профиль или его замена для этого пресета (CONFIG.profileByPreset).
+function profileFor(mode, presetId) {
+  var m = CONFIG.strategyModes[mode] ? mode : CONFIG.defaultStrategy;
+  var o = CONFIG.profileByPreset[m];
+  return (o && o[presetId] && CONFIG.strategyModes[o[presetId]]) ? o[presetId] : m;
+}

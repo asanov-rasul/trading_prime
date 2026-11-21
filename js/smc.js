@@ -312,6 +312,25 @@ var SMC = (function () {
     return r;
   }
 
+  // Диапазон Premium/Discount: от последнего подтверждённого swing low до последнего swing high в окне серии.
+  function swingRange(s, idx, W) {
+    if (!s || idx < 0) return null;
+    var from = Math.max(0, idx - W + 1);
+    var H = swingsIn(s.highs, from, idx), L = swingsIn(s.lows, from, idx);
+    if (!H.length || !L.length) return null;
+    var hi = H[H.length - 1].p, lo = L[L.length - 1].p;
+    return hi > lo ? { lo: lo, hi: hi, eq: (lo + hi) / 2 } : null;
+  }
+  // Диапазон для правила Premium/Discount по профилю: 'htf' — 4H (из bias), 'mtf' — 1H.
+  function pdRangeFor(ctx, bias) {
+    var cfg = ctx.cfg;
+    if (cfg.pdRange === 'mtf') {
+      var rg = memo(ctx.memo, 'rM' + ctx.im, function () { return swingRange(ctx.M, ctx.im, cfg.windows.mtf); });
+      return rg ? { lo: rg.lo, hi: rg.hi, eq: rg.eq, tf: ctx.M.tf } : null;
+    }
+    return bias.range ? { lo: bias.range.lo, hi: bias.range.hi, eq: bias.range.eq, tf: ctx.H.tf } : null;
+  }
+
   // ---------- контекст ----------
   // o: {sym, coin, L, M, H, i, btc:{M,H}|null, cfg, longOnly, memo, btcMemo}
   function makeContext(o) {
@@ -550,6 +569,7 @@ var SMC = (function () {
     }
     // src — исходная зона (OB или FVG), закрытие тела за которой делает вход недействительным.
     var zoneT, src;
+    if (!zone && !poi) return null; // нет ни OB/FVG на младшем ТФ, ни зоны среднего ТФ — входить негде
     if (!zone) { zone = { bot: poi.bot, top: poi.top }; kind = 'poi'; zoneT = poi.t; src = { bot: poi.bot, top: poi.top }; }
     else if (kind === 'fvg') { zoneT = usedFvg.t; src = { bot: usedFvg.bot, top: usedFvg.top }; }
     else { zoneT = ob.t; src = { bot: ob.bot, top: ob.top }; }
@@ -666,7 +686,8 @@ var SMC = (function () {
     var dir = bias.dir;
     r.dir = dir;
     if (dir === -1 && ctx.longOnly) return fail('bias', 'bias медвежий, включён режим «Только LONG»', 'longOnly');
-    if (!bias.range) return fail('bias', 'нет диапазона Premium/Discount');
+    var rng = pdRangeFor(ctx, bias);
+    if (!rng) return fail('bias', 'нет диапазона Premium/Discount (' + (cfg.pdRange === 'mtf' ? M.tf : H.tf) + ')');
     var disp = dir === 1 ? dUp : dDn;
     if (cfg.require.displacement && !disp) return fail('trigger', 'displacement против bias', 'dispDir');
 
@@ -684,12 +705,13 @@ var SMC = (function () {
     if (cfg.require.sweep && sw.level === null) return fail('sweep', 'нет sweep ликвидности перед ' + ev.type);
 
     // 5. Свежая зона интереса на 1H.
-    var eq = bias.range.eq;
+    var eq = rng.eq;
     var poi = findPOI(ctx, dir, sw.ext, L.c[sw.s].t, eq);
-    if (!poi) return fail('poi', 'нет свежей зоны ' + M.tf + ' в ' + (dir === 1 ? 'Discount' : 'Premium') + ' у sweep');
+    if (!poi && !cfg.poi.optional) return fail('poi', 'нет свежей зоны ' + M.tf + ' в ' + (dir === 1 ? 'Discount' : 'Premium') + ' у sweep');
 
     // 6. Зона и цена входа на 15m.
     var ez = entryZone(ctx, lFrom, dir, sw, disp, poi);
+    if (!ez) return fail('entry', 'нет зоны входа ' + L.tf + ' (OB/FVG)');
     var entry = ez.entry;
     if (dir === 1 ? !(entry < eq) : !(entry > eq)) return fail('pd', 'вход вне ' + (dir === 1 ? 'Discount' : 'Premium'));
 
@@ -716,16 +738,16 @@ var SMC = (function () {
     var W = cfg.weights, P = cfg.penalties;
     var vr = disp ? volumeRatio(L, disp.start, disp.end, cfg.displacement.volLookback) : NaN;
     var volOk = isNum(vr) && vr >= cfg.displacement.volMult;
-    var zonePts = poi.quality === 3 ? W.zoneObFvg : (poi.quality === 2 ? W.zoneOb : W.zoneFvg);
-    var zoneName = poi.quality === 3 ? 'OB + FVG' : (poi.quality === 2 ? 'только OB' : 'только FVG');
+    var zonePts = !poi ? 0 : (poi.quality === 3 ? W.zoneObFvg : (poi.quality === 2 ? W.zoneOb : W.zoneFvg));
+    var zoneName = !poi ? 'нет свежей зоны у разворота (не обязательна)' : (poi.quality === 3 ? 'OB + FVG' : (poi.quality === 2 ? 'только OB' : 'только FVG'));
     var roomPts = roomR >= 4 ? W.room4 : W.room3;
     var factors = [
       { key: 'trend', label: 'Тренд ' + H.tf + ' по направлению (' + bias.struct + ', EMA50)', pts: W.trend, max: W.trend, ok: true },
       { key: 'ema200', label: 'EMA200 ' + H.tf + ' подтверждает', pts: bias.emaAlign ? W.ema200 : 0, max: W.ema200, ok: bias.emaAlign },
-      { key: 'pd', label: dir === 1 ? 'Вход в Discount (ниже 50% диапазона)' : 'Вход в Premium (выше 50% диапазона)', pts: W.pd, max: W.pd, ok: true },
+      { key: 'pd', label: (dir === 1 ? 'Вход в Discount (ниже 50% диапазона ' : 'Вход в Premium (выше 50% диапазона ') + rng.tf + ')', pts: W.pd, max: W.pd, ok: true },
       { key: 'sweep', label: sw.level !== null ? 'Sweep: ' + liqLabel(sw.type, dir) : 'Sweep ликвидности', pts: sw.level !== null ? W.sweep : 0, max: W.sweep, ok: sw.level !== null },
       { key: 'structure', label: ev.type + ' на ' + L.tf + (disp ? ' с displacement ×' + disp.mult.toFixed(1) + ' ATR' : ''), pts: disp ? W.structure : 0, max: W.structure, ok: !!disp },
-      { key: 'zone', label: 'Зона ' + M.tf + ': ' + zoneName, pts: zonePts, max: W.zoneObFvg, ok: true },
+      { key: 'zone', label: 'Зона ' + M.tf + ': ' + zoneName, pts: zonePts, max: W.zoneObFvg, ok: !!poi },
       { key: 'ote', label: 'Вход в OTE 0.62–0.79', pts: ez.inOte ? W.ote : 0, max: W.ote, ok: ez.inOte },
       { key: 'volume', label: 'Объём displacement' + (isNum(vr) ? ' ×' + vr.toFixed(2) : ''), pts: volOk ? W.volume : 0, max: W.volume, ok: volOk },
       { key: 'room', label: 'Место до цели: ' + (isFinite(roomR) ? roomR.toFixed(1) + 'R' : 'нет сопротивления в окне'), pts: roomPts, max: W.room4, ok: true }
@@ -762,7 +784,8 @@ var SMC = (function () {
       disp: disp ? { mult: disp.mult, pair: disp.pair, vr: vr } : null,
       ote: ez.ote, inOte: ez.inOte,
       target: tg.nearest ? { p: tg.nearest.p, type: tg.nearest.type, tf: tg.nearest.tf, name: TARGET_NAMES[tg.nearest.type] || tg.nearest.type } : null,
-      bias: { struct: bias.struct, e50: bias.e50, e200: bias.e200, emaAlign: bias.emaAlign, eq: eq, lo: bias.range.lo, hi: bias.range.hi },
+      bias: { struct: bias.struct, e50: bias.e50, e200: bias.e200, emaAlign: bias.emaAlign, eq: eq, lo: rng.lo, hi: rng.hi, pdTf: rng.tf },
+      mode: cfg.strategy || 'strict',
       score: score, factors: factors, penalties: penalties
     };
     r.stage = 'ok';
@@ -776,12 +799,14 @@ var SMC = (function () {
     var cfg = ctx.cfg;
     var bias = computeBias(ctx.H, ctx.ih, cfg.windows.htf, cfg.minBars.htf, cfg);
     var o = { bias: bias, stage: 'flat', text: 'флэт ' + ctx.H.tf };
-    if (bias.dir === 0 || !bias.range) return o;
+    if (bias.dir === 0) return o;
     if (bias.dir === -1 && ctx.longOnly) { o.stage = 'off'; o.text = 'только LONG'; return o; }
+    var rng = pdRangeFor(ctx, bias);
+    if (!rng) { o.stage = 'wait'; o.text = 'нет диапазона ' + (cfg.pdRange === 'mtf' ? ctx.M.tf : ctx.H.tf); return o; }
     var p = isNum(price) ? price : ctx.L.c[ctx.i].c;
-    var inZone = bias.dir === 1 ? p < bias.range.eq : p > bias.range.eq;
-    var poi = findPOI(ctx, bias.dir, p, ctx.T + 1, bias.range.eq);
-    if (poi) { o.stage = 'poi'; o.text = 'у зоны ' + ctx.M.tf + ', ждём sweep'; o.poi = poi; }
+    var inZone = bias.dir === 1 ? p < rng.eq : p > rng.eq;
+    var poi = findPOI(ctx, bias.dir, p, ctx.T + 1, rng.eq);
+    if (poi) { o.stage = 'poi'; o.text = 'у зоны ' + ctx.M.tf + ', ждём ' + (cfg.require.sweep ? 'sweep и CHoCH' : 'CHoCH/BOS'); o.poi = poi; }
     else if (inZone) { o.stage = 'wait'; o.text = 'в ' + (bias.dir === 1 ? 'Discount' : 'Premium') + ', нет зоны'; }
     else { o.stage = 'wait'; o.text = 'ждём ' + (bias.dir === 1 ? 'Discount' : 'Premium'); }
     return o;
@@ -793,7 +818,7 @@ var SMC = (function () {
     emaArr: emaArr, atrArr: atrArr, trueRange: trueRange, findSwings: findSwings, swingsIn: swingsIn,
     buildSeries: buildSeries, structure: structure, displacement: displacement, volumeRatio: volumeRatio,
     findOBs: findOBs, findFVGs: findFVGs, zoneState: zoneState, fvgFill: fvgFill, intersect: intersect,
-    equalLevels: equalLevels, prevDay: prevDay, computeBias: computeBias, makeContext: makeContext,
+    equalLevels: equalLevels, prevDay: prevDay, computeBias: computeBias, swingRange: swingRange, makeContext: makeContext,
     findSweep: findSweep, findPOI: findPOI, entryZone: entryZone, findTargets: findTargets,
     lowVolatility: lowVolatility, levelsFrom: levelsFrom, detect: detect, overview: overview, obZone: obZone
   };

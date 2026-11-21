@@ -324,17 +324,47 @@ var UI = (function () {
   // =====================================================================================
   // ЭКРАН «ЛУЧШАЯ СДЕЛКА СЕЙЧАС»
   // =====================================================================================
+  function modeName(m) { return (C.strategyModes[m] || C.strategyModes.strict).name; }
+  // Срок ожидания входа: «12 свечей 15m (3 ч)».
+  function plural(n, one, few, many) {
+    var a = Math.abs(n) % 100, b = a % 10;
+    if (a > 10 && a < 20) return many;
+    if (b === 1) return one;
+    if (b >= 2 && b <= 4) return few;
+    return many;
+  }
+  function hoursText(bars, tf) {
+    var mins = bars * SMC.tfMs(tf || C.timeframes.ltf) / 60000;
+    if (mins < 60) return Math.round(mins) + ' мин';
+    var hrs = mins / 60;
+    if (hrs >= 48 && hrs % 24 === 0) return (hrs / 24) + ' дн';
+    return (hrs % 1 === 0 ? String(hrs) : hrs.toFixed(1)) + ' ч';
+  }
+  function waitText(bars, tf) {
+    bars = bars || C.lifecycle.expiryBars;
+    return bars + ' ' + plural(bars, 'свеча', 'свечи', 'свечей') + ' ' + (tf || C.timeframes.ltf) + ' (' + hoursText(bars, tf) + ')';
+  }
+  function modeChip(sig) {
+    var M = C.strategyModes[sig.mode];
+    return (M && sig.mode !== 'strict') ? h('span', { class: 'chip ' + sig.mode, title: 'Профиль стратегии: ' + M.name }, M.short) : null;
+  }
+  function presetOf(sig) { return C.presets[sig.preset] || C.presets.main; }
+  function presetChip(sig) {
+    var P = presetOf(sig);
+    return P.id === 'main' ? null : h('span', { class: 'chip preset', title: P.name }, P.short);
+  }
   function accuracyBlock(sig) {
-    var acc = Signals.Calib.accuracy(sig.coin, sig.score);
+    var acc = Signals.Calib.accuracy(sig.coin, sig.score, sig.mode, sig.preset);
     var wrap = h('div', { class: 'acc' });
+    var calName = 'профиля «' + modeName(sig.mode) + '», пресет ' + presetOf(sig).short;
     if (!acc) {
-      var tn = Signals.Calib.totals().n;
+      var tn = Signals.Calib.totals(sig.mode, sig.preset).n;
       wrap.appendChild(h('div', { class: 'acc-num ' + accColor(sig.score) }, String(sig.score)));
       wrap.appendChild(h('div', { class: 'acc-label' }, 'Score · предварительная оценка'));
       wrap.appendChild(h('div', { class: 'acc-sub' }, tn > 0
-        ? 'Калибровка ненадёжна: в истории всего ' + tn + ' сделок (нужно не меньше ' + C.calibration.minTotal + ') — точность не показывается'
-        : 'Калибровки по истории ещё нет'));
-      wrap.appendChild(h('button', { type: 'button', class: 'btn small', onclick: function () { App.calibrate(); } }, 'Откалибровать'));
+        ? 'Калибровка ' + calName + ' ненадёжна: в истории всего ' + tn + ' сделок (нужно не меньше ' + C.calibration.minTotal + ') — точность не показывается'
+        : 'Калибровки ' + calName + ' по истории ещё нет'));
+      if (sig.mode === (App.settings.strategy || 'strict')) wrap.appendChild(h('button', { type: 'button', class: 'btn small', onclick: function () { App.calibrate(sig.preset); } }, 'Откалибровать'));
     } else {
       var v = Math.round(acc.value * 100);
       wrap.appendChild(h('div', { class: 'acc-num ' + accColor(v) }, v + '%'));
@@ -343,6 +373,10 @@ var UI = (function () {
       if (acc.smoothed) sub += ' (сглажено к общей ' + Math.round(acc.p * 100) + '%)';
       sub += ' · корзина ' + Signals.Calib.bucketLabel(acc.bucket) + ', ' + acc.scope;
       wrap.appendChild(h('div', { class: 'acc-sub' }, sub));
+      var ci = Signals.Calib.info(sig.mode, sig.preset), calWait = ci && ci.expiryBars ? ci.expiryBars : C.lifecycle.expiryBars;
+      if (calWait !== (sig.expiryBars || C.lifecycle.expiryBars)) {
+        wrap.appendChild(h('div', { class: 'acc-sub warn-text' }, 'Калибровка сделана при ожидании входа ' + waitText(calWait) + ', а у сигнала — ' + waitText(sig.expiryBars) + '. Откалибруйте заново для точной оценки.'));
+      }
     }
     wrap.appendChild(h('div', { class: 'acc-note' }, 'Оценка, а не гарантия'));
     return wrap;
@@ -384,7 +418,7 @@ var UI = (function () {
     var cv = h('canvas', { class: 'chart', 'aria-label': 'Мини-график свечей ' + sig.coin });
     holder.appendChild(cv);
     var draw = function () {
-      var cds = App.candlesFor(sig.sym);
+      var cds = App.candlesFor(sig.sym, sig.tf && sig.tf.ltf);
       var zones = [];
       if (sig.poi) zones.push({ bot: sig.poi.bot, top: sig.poi.top, from: sig.poi.t, color: 'rgba(250, 204, 21, 0.10)' });
       zones.push({ bot: sig.zone.bot, top: sig.zone.top, from: sig.zone.t, color: 'rgba(96, 165, 250, 0.22)' });
@@ -410,7 +444,7 @@ var UI = (function () {
     var card = h('div', { class: 'card signal-card' });
     card.appendChild(h('div', { class: 'sig-head' },
       h('div', { class: 'sig-coin' }, sig.coin, h('span', { class: 'sig-pair' }, '/' + C.quote)),
-      badgeSide(sig.dir), statusChip(sig, prov)));
+      badgeSide(sig.dir), statusChip(sig, prov), presetChip(sig), modeChip(sig)));
     if (sig.late) card.appendChild(h('div', { class: 'note warn' }, 'Сигнал найден при загрузке приложения: вход мог пройти без вас.'));
     card.appendChild(accuracyBlock(sig));
     card.appendChild(levelsTable(sig));
@@ -421,7 +455,10 @@ var UI = (function () {
       sig.status === 'pending' ? kv('Срок входа', 'до ' + fTime(sig.expiresT) + ' (' + fAgo(sig.expiresT - nowT) + ')') : kv('Вход', fDT(sig.filledT)),
       sig.status === 'active' ? kv('Текущий результат', fR(Signals.openR(sig, price))) : kv('До входа', isNum(price) ? fPct(pctFrom(price, sig.entry)) : '—'),
       kv('Создан', fDT(sig.createdT)),
-      kv('ТФ', sig.tf.htf + ' → ' + sig.tf.mtf + ' → ' + sig.tf.ltf)
+      kv('ТФ', sig.tf.htf + ' → ' + sig.tf.mtf + ' → ' + sig.tf.ltf),
+      kv('Пресет', presetOf(sig).name),
+      kv('Профиль стратегии', modeName(sig.mode)),
+      kv('Ожидание входа', waitText(sig.expiryBars, sig.tf && sig.tf.ltf))
     );
     card.appendChild(meta);
     var chartBox = h('div', { class: 'chart-box' });
@@ -441,7 +478,8 @@ var UI = (function () {
         fP(r.price), trend, { v: r.status, cls: r.statusCls || '' }, r.score === null ? '—' : String(r.score)
       ] };
     });
-    return tableWrap(mkTable(['Монета', 'Цена', 'Тренд 4H', 'Статус', 'Score'], rows, { cls: 'coins' }));
+    var PP = C.presets[App.primaryPreset()];
+    return tableWrap(mkTable(['Монета', 'Цена', 'Тренд ' + PP.htf.toUpperCase(), 'Статус', 'Score'], rows, { cls: 'coins' }));
   }
   function renderBest() {
     var root = $('screen-best');
@@ -451,11 +489,19 @@ var UI = (function () {
     if (best) root.appendChild(signalCardFull(best));
     else {
       var st = App.feedStatus();
-      var msg = st.state === 'loading' || !st.lastUpdate ? 'Загружаю данные и анализирую рынок…' : 'Сейчас нет качественных сетапов — лучше ждать';
-      root.appendChild(h('div', { class: 'card empty' },
-        h('div', { class: 'empty-title' }, msg),
-        h('p', { class: 'muted' }, 'Бот публикует сигнал только при полном сценарии SMC (bias ' + C.timeframes.htf + ', свежая зона ' + C.timeframes.mtf + ', sweep и CHoCH/BOS на ' + C.timeframes.ltf + ') и score не ниже ' + App.settings.minScore + '. Отсутствие сигнала — правильный результат, а не ошибка.'),
-        !Signals.Calib.has() ? h('button', { type: 'button', class: 'btn small', onclick: function () { App.calibrate(); } }, 'Откалибровать точность (бэктест 60 дней)') : null));
+      if (st.state === 'error' || (st.state === 'loading' && st.error)) {
+        root.appendChild(h('div', { class: 'card empty' },
+          h('div', { class: 'empty-title' }, 'Нет связи с биржами'),
+          h('p', { class: 'muted' }, (st.error || 'Нет ответа').replace(/[.\s]+$/, '') + '. Приложение само повторяет подключение и перебирает источники: Binance Futures → Binance Spot → Bybit. Проверьте интернет; если биржи заблокированы в вашей сети, данные не загрузятся.')));
+      } else {
+        var msg = st.state === 'loading' || !st.lastUpdate ? 'Загружаю данные и анализирую рынок…' : 'Сейчас нет качественных сетапов — лучше ждать';
+        var soft = App.settings.strategy !== 'strict', pids = App.activePresets();
+        var tfsText = pids.map(function (pid) { var P = C.presets[pid]; return P.short + ' ' + P.htf + '/' + P.mtf + '/' + P.ltf; }).join(', ');
+        root.appendChild(h('div', { class: 'card empty' },
+          h('div', { class: 'empty-title' }, msg),
+          h('p', { class: 'muted' }, 'Профиль «' + modeName(App.settings.strategy) + '», таймфреймы: ' + tfsText + '. Бот публикует сигнал только при полном сценарии SMC (тренд старшего ТФ, свежая зона среднего, ' + (soft ? 'CHoCH/BOS' : 'sweep и CHoCH/BOS') + ' на младшем) и score не ниже ' + App.settings.minScore + '. Отсутствие сигнала — правильный результат, а не ошибка.'),
+          !Signals.Calib.has(App.settings.strategy, pids[0]) ? h('button', { type: 'button', class: 'btn small', onclick: function () { App.calibrate(pids[0]); } }, 'Откалибровать точность (бэктест 60 дней)') : null));
+      }
     }
     var others = App.openSignals().filter(function (s) { return !best || s.id !== best.id; });
     if (others.length) {
@@ -465,9 +511,9 @@ var UI = (function () {
     root.appendChild(footer());
   }
   function miniSignal(sig) {
-    var acc = Signals.Calib.accuracy(sig.coin, sig.score);
+    var acc = Signals.Calib.accuracy(sig.coin, sig.score, sig.mode, sig.preset);
     return h('div', { class: 'mini' },
-      h('div', { class: 'mini-top' }, h('b', null, sig.coin), badgeSide(sig.dir), statusChip(sig, App.provisionalOf(sig))),
+      h('div', { class: 'mini-top' }, h('b', null, sig.coin), badgeSide(sig.dir), statusChip(sig, App.provisionalOf(sig)), presetChip(sig), modeChip(sig)),
       h('div', { class: 'mini-lv' }, 'Вход ' + fP(sig.entry) + ' · SL ' + fP(sig.sl) + ' · TP3 ' + fP(sig.tp3)),
       h('div', { class: 'mini-sub' }, 'score ' + sig.score + (acc ? ' · точность ' + Math.round(acc.value * 100) + '%' : ' · предварительно') + ' · ' + fDT(sig.createdT)),
       h('div', { class: 'row-btns' }, h('button', { type: 'button', class: 'btn small', onclick: function () { App.toCalc(sig.id); } }, 'В калькулятор')));
@@ -476,7 +522,7 @@ var UI = (function () {
   // =====================================================================================
   // ЭКРАН «СИГНАЛЫ»
   // =====================================================================================
-  var sigFilter = 'all';
+  var sigFilter = 'all', sigMode = 'all', sigPreset = 'all';
   function renderSignals() {
     var root = $('screen-signals');
     clear(root);
@@ -485,7 +531,10 @@ var UI = (function () {
     var all = Signals.Journal.list.slice();
     var coins = [];
     all.forEach(function (s) { if (coins.indexOf(s.coin) < 0) coins.push(s.coin); });
-    var list = sigFilter === 'all' ? all : all.filter(function (s) { return s.coin === sigFilter; });
+    var list = all.filter(function (s) {
+      return (sigFilter === 'all' || s.coin === sigFilter) && (sigMode === 'all' || (s.mode || 'strict') === sigMode) &&
+        (sigPreset === 'all' || (s.preset || 'main') === sigPreset);
+    });
     var st = Signals.stats(list);
     root.appendChild(section('Статистика журнала (live)', h('div', { class: 'kv-grid' },
       kv('Сигналов', String(st.signals)), kv('Открыто', String(st.open)),
@@ -495,7 +544,12 @@ var UI = (function () {
       kv('Сумма', st.n ? fR(st.sumR) : '—'), kv('Profit factor', isNum(st.pf) ? fN(st.pf, 2) : (st.pf === Infinity ? '∞' : '—'))
     )));
     var opts = [['all', 'Все монеты']].concat(coins.map(function (c) { return [c, c]; }));
-    root.appendChild(h('div', { class: 'toolbar' }, field('Фильтр по монете', select(opts, sigFilter, function (e) { sigFilter = e.target.value; renderSignals(); }))));
+    var modeOpts = [['all', 'Все профили']].concat(Object.keys(C.strategyModes).map(function (k) { return [k, C.strategyModes[k].name]; }));
+    var presetOpts = [['all', 'Все пресеты']].concat(Object.keys(C.presets).map(function (k) { return [k, C.presets[k].name]; }));
+    root.appendChild(h('div', { class: 'toolbar' },
+      field('Фильтр по монете', select(opts, sigFilter, function (e) { sigFilter = e.target.value; renderSignals(); })),
+      field('Пресет', select(presetOpts, sigPreset, function (e) { sigPreset = e.target.value; renderSignals(); })),
+      field('Профиль стратегии', select(modeOpts, sigMode, function (e) { sigMode = e.target.value; renderSignals(); }))));
     if (!list.length) root.appendChild(h('div', { class: 'card empty' }, h('div', { class: 'empty-title' }, 'Журнал пуст'), h('p', { class: 'muted' }, 'Сюда попадают все выданные сигналы и их итог: TP1, TP2, TP3, SL, безубыток, просрочен.')));
     var box = h('div', { class: 'sig-list' });
     list.forEach(function (sig) { box.appendChild(journalItem(sig)); });
@@ -504,11 +558,11 @@ var UI = (function () {
   }
   function journalItem(sig) {
     var prov = App.provisionalOf(sig);
-    var acc = Signals.Calib.accuracy(sig.coin, sig.score);
+    var acc = Signals.Calib.accuracy(sig.coin, sig.score, sig.mode, sig.preset);
     var res = sig.status === 'closed' ? fR(sig.resultR) : (sig.status === 'active' ? fR(Signals.openR(sig, App.priceOf(sig.sym))) + ' (открыта)' : '');
     var item = h('details', { class: 'card j-item' });
     item.appendChild(h('summary', null,
-      h('div', { class: 'j-top' }, h('b', null, sig.coin), badgeSide(sig.dir), statusChip(sig, prov), h('span', { class: 'j-res ' + (sig.resultR > 0 ? 'good' : (sig.resultR < 0 ? 'bad' : '')) }, res)),
+      h('div', { class: 'j-top' }, h('b', null, sig.coin), badgeSide(sig.dir), statusChip(sig, prov), presetChip(sig), modeChip(sig), h('span', { class: 'j-res ' + (sig.resultR > 0 ? 'good' : (sig.resultR < 0 ? 'bad' : '')) }, res)),
       h('div', { class: 'j-sub' }, fDT(sig.createdT) + ' · score ' + sig.score + (acc ? ' · точность ' + Math.round(acc.value * 100) + '%' : '') + (sig.late ? ' · найден при загрузке' : ''))));
     item.appendChild(levelsTable(sig));
     var ex = h('ul', { class: 'why-extra' });
@@ -613,7 +667,13 @@ var UI = (function () {
     root.appendChild(h('p', { class: 'muted' }, 'Прогон тех же функций detect() и validate(), что и в live-режиме, по истории. Параметры стратегии фиксированы в CONFIG и не подгоняются под историю.'));
     var coinOpts = [['all', 'Все монеты']].concat(App.activeCoins().map(function (c) { return [c.coin, c.coin]; }));
     var presetOpts = Object.keys(C.presets).map(function (k) { return [k, C.presets[k].name]; });
+    var modeOpts = Object.keys(C.strategyModes).map(function (k) { return [k, C.strategyModes[k].name]; });
+    var waitOpts = C.lifecycle.expiryOptions.map(function (b) {
+      return [b, b + ' ' + plural(b, 'свеча', 'свечи', 'свечей') + (b === C.lifecycle.expiryBars ? ' — по промпту' : '')];
+    });
     var form = h('div', { class: 'form-grid' },
+      field('Профиль стратегии', select(modeOpts, p.mode || 'strict', function (e) { p.mode = e.target.value; }), 'мягкий: sweep не обязателен, P/D по 1H, вход у границы зоны'),
+      field('Ожидание входа', select(waitOpts, p.expiryBars || C.lifecycle.expiryBars, function (e) { p.expiryBars = Number(e.target.value); }), 'свечей младшего ТФ; на 15m: ' + C.lifecycle.expiryOptions.map(function (b) { return hoursText(b, '15m'); }).join(' / ')),
       field('Монета', select(coinOpts, p.coin, function (e) { p.coin = e.target.value; })),
       field('Период', seg(C.backtest.days.map(function (d) { return [d, d + ' дн']; }), p.days, function (v) { p.days = Number(v); renderBacktest(); })),
       field('Пресет таймфреймов', select(presetOpts, p.presetId, function (e) { p.presetId = e.target.value; }), 'сравнивайте пресеты только по контрольным 30%'),
@@ -635,8 +695,9 @@ var UI = (function () {
     if (res) renderBtResult(root, res);
     var cmp = Data.Store.get(C.storage.presets, []);
     if (Array.isArray(cmp) && cmp.length) {
-      root.appendChild(section('Сравнение пресетов (только контрольные 30%)', tableWrap(mkTable(['Пресет', 'Период', 'Сделок', '✓', 'Средний R', 'PF', 'Дата'], cmp.map(function (x) {
-        return { cells: [x.presetName, x.days + ' дн', String(x.n), fRate(x.winRate), fR(x.avgR), isNum(x.pf) ? fN(x.pf, 2) : '—', fDT(x.ts)] };
+      root.appendChild(section('Сравнение вариантов (только контрольные 30%)', tableWrap(mkTable(['Пресет', 'Профиль', 'Ожидание', 'Период', 'Сделок', '✓', 'Средний R', 'PF', 'Дата'], cmp.map(function (x) {
+        var eb = x.expiryBars || C.lifecycle.expiryBars;
+        return { cells: [x.presetName, modeName(x.mode), eb + ' ' + plural(eb, 'свеча', 'свечи', 'свечей'), x.days + ' дн', String(x.n), fRate(x.winRate), fR(x.avgR), isNum(x.pf) ? fN(x.pf, 2) : '—', fDT(x.ts)] };
       })))));
     }
     root.appendChild(footer());
@@ -656,10 +717,11 @@ var UI = (function () {
   var STATS_HEAD = ['', 'Сигналов', 'Сделок', '✓', 'Средний R', 'PF', 'Сумма R'];
   function renderBtResult(root, res) {
     var m = res.meta, s = res.summary;
-    root.appendChild(h('div', { class: 'note' }, m.presetName + ' · ' + m.days + ' дн (' + fDate(m.startT) + ' — ' + fDate(m.endT) + ') · minScore ' + m.minScore + ' · комиссия ' + m.feePct + '% · проскальзывание ' + m.slipPct + '% · ' + m.source + (m.longOnly ? ' · только LONG' : '')));
+    var modeTxt = modeName(m.mode) + (m.requestedMode && m.requestedMode !== m.mode ? ' (выбран «' + modeName(m.requestedMode) + '»: на этом пресете — правила «' + modeName(m.mode) + '»)' : '');
+    root.appendChild(h('div', { class: 'note' }, m.presetName + ' · профиль «' + modeTxt + '» · ожидание входа ' + waitText(m.expiryBars, m.tf && m.tf.ltf) + ' · ' + m.days + ' дн (' + fDate(m.startT) + ' — ' + fDate(m.endT) + ') · minScore ' + m.minScore + ' · комиссия ' + m.feePct + '% · проскальзывание ' + m.slipPct + '% · ' + m.source + (m.longOnly ? ' · только LONG' : '')));
     if (s.n < C.backtest.minTrades) root.appendChild(h('div', { class: 'note warn' }, 'Выборка мала, выводы ненадёжны (сделок: ' + s.n + ', нужно хотя бы ' + C.backtest.minTrades + ').'));
     (res.warnings || []).forEach(function (w) { root.appendChild(h('div', { class: 'note warn' }, w)); });
-    if (res.calibrated) root.appendChild(h('div', { class: 'note good' }, 'Калибровка точности обновлена по корзинам score этого прогона.'));
+    if (res.calibrated) root.appendChild(h('div', { class: 'note good' }, 'Калибровка точности обновлена: профиль «' + modeName(m.mode) + '», пресет ' + (C.presets[m.presetId] || C.presets.main).short + '.'));
     root.appendChild(section('Сводка', h('div', { class: 'kv-grid' },
       kv('Сигналов', String(s.signals)), kv('Входов', String(s.entries)),
       kv('Просрочено', String(s.expired + s.invalidated)), kv('Открыто на конец', String(s.open)),
@@ -742,6 +804,92 @@ var UI = (function () {
     }
   }
 
+  // ---------- проверка «Сигналов в день» (все цифры — из App.runLiveCheck) ----------
+  function fDay(t, wd) { return new Date(t).toLocaleDateString('ru-RU', wd ? { weekday: 'short', day: '2-digit', month: '2-digit' } : { day: '2-digit', month: '2-digit' }); }
+  // Столбики «сигналов за день»: зелёные — 3 и больше, жёлтые — 1–2, пустые — 0; пунктир — уровень 3.
+  function dayBars(r) {
+    var days = r.days || [], top = Math.max(3, isNum(r.max) ? r.max : 0);
+    var grid = h('div', {
+      class: 'daybars', role: 'img', style: 'grid-template-columns:repeat(' + Math.max(1, days.length) + ',minmax(0,1fr))',
+      'aria-label': 'Сигналов по дням: ' + days.map(function (d) { return fDay(d.t) + ' — ' + d.n; }).join(', ')
+    });
+    days.forEach(function (d) {
+      grid.appendChild(h('div', { class: 'db-col', title: fDay(d.t, true) + ': ' + d.n + ' ' + plural(d.n, 'сигнал', 'сигнала', 'сигналов') + ', входов ' + d.e },
+        h('div', { class: 'db-bar ' + (d.n >= 3 ? 'ok' : (d.n ? 'low' : 'zero')), style: d.n ? 'height:' + Math.max(4, Math.round(d.n / top * 100)) + '%' : null })));
+    });
+    var line = h('div', { class: 'db-line', style: 'bottom:' + (3 / top * 100).toFixed(1) + '%' }, h('span', null, '3'));
+    var rows = days.slice().reverse().map(function (d) {
+      return { cells: [fDay(d.t, true), { v: String(d.n), cls: d.n >= 3 ? 'good' : (d.n ? '' : 'muted') }, String(d.e)] };
+    });
+    return h('div', { class: 'daybars-box' },
+      h('div', { class: 'muted small' }, 'Сигналов за день: зелёные — 3 и больше, жёлтые — 1–2, пустые — ни одного'),
+      h('div', { class: 'daybars-wrap' }, grid, line),
+      h('div', { class: 'db-axis muted small' }, h('span', null, days.length ? fDay(days[0].t) : ''), h('span', null, days.length ? fDay(days[days.length - 1].t) : '')),
+      h('details', { class: 'db-details' }, h('summary', null, 'По дням: сигналы и входы'), tableWrap(mkTable(['День', 'Сигналов', 'Входов'], rows))));
+  }
+  function liveCheckCard() {
+    var lc = App.lc, r = lc.res, body = [];
+    var pids = App.activePresets();
+    body.push(h('p', { class: 'muted small' }, 'Прогон текущих настроек live по истории за ' + C.liveCheck.days + ' дней: те же detect() и validate(), что в live, по всем монетам списка и всем включённым пресетам (сейчас: ' +
+      pids.map(function (p) { return C.presets[p].short; }).join(', ') + '). Калибровку и результаты бэктеста не меняет.'));
+    if (lc.running) {
+      body.push(h('div', { class: 'progress' }, h('div', { class: 'bar', style: 'width:' + Math.round((lc.progress.frac || 0) * 100) + '%' })));
+      body.push(h('div', { class: 'muted small', id: 'lc-progress-text' }, lc.progress.text || ''));
+      body.push(h('div', { class: 'row-btns' }, h('button', { type: 'button', class: 'btn danger', onclick: function () { App.cancelLiveCheck(); } }, 'Остановить')));
+    } else {
+      body.push(h('div', { class: 'row-btns' },
+        h('button', { type: 'button', class: 'btn primary', onclick: function () { App.runLiveCheck(); } }, r ? 'Проверить заново' : 'Проверить на истории'),
+        h('span', { class: 'muted small' }, 'история всех монет грузится несколько минут')));
+    }
+    if (lc.error) body.push(h('div', { class: 'note err' }, 'Проверка остановлена: ' + lc.error));
+    if (r) {
+      var rules = (r.presets || []).map(function (p, k) {
+        return (r.modes && r.modes[k] && r.modes[k] !== r.snap.strategy) ? ' (' + C.presets[p].short + ' — по правилам «' + modeName(r.modes[k]) + '»)' : '';
+      }).join('');
+      body.push(h('div', { class: 'note' }, 'Проверено ' + fDT(r.ts) + ' · история ' + fDate(r.fromT) + ' — ' + fDate(r.toT) + ' · профиль «' + modeName(r.snap.strategy) + '»' + rules +
+        ' · пресеты: ' + (r.presets || []).map(function (p) { return C.presets[p].short; }).join(', ') + ' · монет ' + r.coins + ' · ожидание входа ' + r.snap.expiryBars + ' ' +
+        plural(r.snap.expiryBars, 'свеча', 'свечи', 'свечей') + ' · minScore ' + r.snap.minScore + (r.snap.mode === 'long' ? ' · только LONG' : '') + ' · ' + r.source));
+      if (App.liveCheckStale()) body.push(h('div', { class: 'note warn' }, 'Настройки live изменились после проверки: цифры ниже относятся к прежним настройкам. Запустите проверку заново.'));
+      body.push(h('div', { class: 'kv-grid' },
+        kv('Сигналов в день, в среднем', fN(r.avg, 1)),
+        kv('Дней с 3+ сигналами', r.ge3 + ' из ' + r.nDays, r.nDays && r.ge3 === r.nDays ? 'good' : ''),
+        kv('Дней без сигналов', String(r.zero)),
+        kv('Меньше всего / больше всего', (isNum(r.min) ? r.min : '—') + ' / ' + (isNum(r.max) ? r.max : '—')),
+        kv('Входов в день (лимит исполнился)', fN(r.avgEntries, 1)),
+        kv('Сделок за период', String(r.n)),
+        kv('Успешных ✓', r.n ? r.wins + ' (' + fRate(r.winRate) + ')' : '—', 'good'),
+        kv('Неуспешных ✗', r.n ? String(r.losses) : '—', 'bad'),
+        kv('Итог', fR(r.sumR), r.sumR > 0 ? 'good' : (r.sumR < 0 ? 'bad' : '')),
+        kv('Profit factor', isNum(r.pf) ? fN(r.pf, 2) : (r.pfInf ? '∞' : '—')),
+        kv('Итог при риске 1%', fPct(r.compPct) + ' (сложный процент)'),
+        kv('Контроль: последние 30%', r.outN + ' ' + plural(r.outN, 'сделка', 'сделки', 'сделок') + ', ' + fR(r.outSumR), r.outSumR > 0 ? 'good' : (r.outSumR < 0 ? 'bad' : ''))
+      ));
+      body.push(dayBars(r));
+      if (r.n < C.backtest.minTrades) body.push(h('div', { class: 'note warn' }, 'Выборка мала, выводы ненадёжны (сделок: ' + r.n + ', нужно хотя бы ' + C.backtest.minTrades + ').'));
+      (r.warnings || []).forEach(function (w) { body.push(h('div', { class: 'note warn' }, w)); });
+      body.push(h('ul', { class: 'why-extra' }, [
+        h('li', null, 'По дням считаются только полные сутки по вашему времени (' + r.nDays + ' ' + plural(r.nDays, 'день', 'дня', 'дней') + '), сделки — за весь период.'),
+        h('li', null, 'Пресеты прогоняются отдельно и объединяются по правилам live: по монете одновременно открыт один сигнал, пауза после SL общая. Это приближение к live, а не точная копия.'),
+        h('li', null, 'Прошлые дни не гарантируют будущих: число сигналов зависит от того, насколько активен рынок.')
+      ]));
+    }
+    return h('div', { class: 'card', id: 'lc-card' }, h('h3', { class: 'card-title' }, 'Сигналов в день: проверка на истории'), body);
+  }
+  // Обновление карточки проверки: full — перестроить, иначе только полоса прогресса.
+  function updateLiveCheck(full) {
+    var card = $('lc-card');
+    if (!card) return;
+    if (!full) {
+      var bar = card.querySelector('.progress .bar'), tx = $('lc-progress-text');
+      if (bar && tx) {
+        bar.style.width = Math.round((App.lc.progress.frac || 0) * 100) + '%';
+        tx.textContent = App.lc.progress.text || '';
+        return;
+      }
+    }
+    card.replaceWith(liveCheckCard());
+  }
+
   // =====================================================================================
   // ЭКРАН «НАСТРОЙКИ»
   // =====================================================================================
@@ -752,6 +900,86 @@ var UI = (function () {
     root.appendChild(h('h2', { class: 'screen-title' }, 'Настройки'));
     var srcOpts = [['auto', 'Авто: Futures → Spot → Bybit']].concat(C.sourceOrder.map(function (id) { return [id, Data.ADAPTERS[id].name]; }));
     var coinsInp = h('input', { type: 'text', class: 'inp', value: s.symbols.join(', '), autocapitalize: 'characters', spellcheck: 'false' });
+    // Таймфреймы live-сигналов: один из пресетов или все три сразу.
+    var pids = App.activePresets();
+    var liveSeg = seg([['main', C.presets.main.name], ['swing', C.presets.swing.name], ['scalp', C.presets.scalp.name], ['all', 'Все сразу']], s.livePreset, function (v) {
+      if (v === s.livePreset) return;
+      App.updateSettings({ livePreset: v }, false);
+      toast('Таймфреймы live: ' + (v === 'all' ? 'все сразу' : C.presets[v].name) + ' — загружаю данные', 'good');
+      renderSettings();
+    });
+    // Режим «3+ сигнала в день» — одной кнопкой: частый профиль, все пресеты, 30 монет, ожидание 96 свечей.
+    // Цифр здесь нет: сколько сигналов в день дают настройки, считает проверка на истории (карточка ниже).
+    var many = App.isManySignals(), mp = C.manySignalsPreset;
+    root.appendChild(section('Режим «3+ сигнала в день»', [
+      h('p', { class: 'muted small' }, 'Частый профиль (на скальпе — мягкие правила), все пресеты сразу, ' + C.extendedSymbols.length + ' монет, ожидание входа ' + mp.expiryBars + ' свечей, minScore ' + mp.minScore + '.'),
+      h('ul', { class: 'why-extra' }, [
+        h('li', null, 'Гарантии «каждый день» нет: сетапы появляются, когда их даёт рынок. В спокойные дни сигналов меньше трёх, в активные — больше.'),
+        h('li', null, 'Сколько сигналов в день выходит на ваших монетах и чем закончились сделки, покажет проверка ниже. Её цифры считает приложение по свежей истории.'),
+        h('li', null, 'Каждый сигнал слабее, чем в строгом и мягком профиле. Монеты двигаются вместе: не открывайте больше 2–3 сделок одновременно.')
+      ]),
+      h('div', { class: 'row-btns' }, many
+        ? h('span', { class: 'chip good' }, 'Режим включён')
+        : h('button', { type: 'button', class: 'btn primary', onclick: function () { App.applyManySignals(); toast('Режим «3+ сигнала в день» включён — загружаю ' + C.extendedSymbols.length + ' монет', 'good'); renderSettings(); } }, 'Включить режим'))
+    ]));
+    root.appendChild(liveCheckCard());
+    root.appendChild(section('Таймфреймы live-сигналов', [
+      liveSeg,
+      h('ul', { class: 'why-extra' }, [
+        h('li', null, 'Основной 4H/1H/15m — как в промпте: тренд 4H, зона 1H, вход 15m. Сделки длятся часы и дни.'),
+        h('li', null, 'Свинг 1D/4H/1H — сигналов меньше, сделки дольше (дни), стопы шире.'),
+        h('li', null, 'Скальп 1H/15m/5m — сигналов больше, сделки короче (часы), стопы уже; откаты есть даже при сильном тренде.'),
+        h('li', null, 'Все сразу — три пресета параллельно, данных и запросов больше. По одной монете одновременно открыт только один сигнал (первым проверяется основной пресет).'),
+        h('li', null, 'Правила стратегии одинаковые, отличаются только таймфреймы. Проверить каждый пресет можно в бэктесте; калибровка точности ведётся для каждого пресета отдельно.')
+      ])
+    ]));
+    var modeSeg = seg([['strict', 'Строгий (по промпту)'], ['soft', 'Мягкий'], ['frequent', 'Частый']], s.strategy, function (v) {
+      if (v === s.strategy) return;
+      App.updateSettings({ strategy: v }, false);
+      toast('Профиль: ' + modeName(v) + ' — последние свечи перепроверены по его правилам', 'good');
+      renderSettings();
+    });
+    var modeHints = {
+      strict: [
+        'Все условия промпта обязательны: тренд старшего ТФ, вход из Discount/Premium его диапазона, свежая зона среднего ТФ, sweep, CHoCH/BOS с displacement на младшем.',
+        'Сигналов очень мало, зато каждый — полный сетап. Сколько их выходит на ваших монетах, покажет проверка «Сигналов в день» выше.'
+      ],
+      soft: [
+        'Sweep ликвидности не обязателен: если он был, даёт +' + C.weights.sweep + ' к score, если нет — сигнал всё равно возможен.',
+        'Premium/Discount считается по диапазону среднего ТФ (откат внутри тренда старшего), а не по большому диапазону старшего ТФ.',
+        'Вход у ближней к цене границы зоны (чаще исполняется, но стоп и R шире).',
+        'Остальное как в строгом: тренд старшего ТФ, свежая зона среднего, CHoCH/BOS с displacement на младшем, риск 0.25–3%, место ≥ 3R, двойная проверка.'
+      ],
+      frequent: [
+        'Всё из мягкого, плюс: зона среднего ТФ желательна (+ до ' + C.weights.zoneObFvg + ' баллов), но не обязательна; если есть — может быть дальше, до 1×ATR.',
+        'Импульс на слом слабее: тело от 1.2×ATR (пара свечей — от 1.6×ATR) вместо 1.5 и 2.0.',
+        'Место для хода от 2.5R вместо 3R.',
+        'Остаются: тренд старшего ТФ, Premium/Discount, CHoCH/BOS, риск 0.25–3%, minScore и двойная проверка. Сигналов больше, но каждый слабее — смотрите бэктест.',
+        'На скальпе (5m) частый профиль работает по мягким правилам: ослабленные фильтры на 5m дают слишком много шума.'
+      ]
+    };
+    root.appendChild(section('Профиль стратегии', [
+      modeSeg,
+      h('ul', { class: 'why-extra' }, (modeHints[s.strategy] || modeHints.strict).map(function (t) { return h('li', null, t); })),
+      h('div', { class: 'muted small' }, 'Мягкий и частый профили заданы заранее, а не подобраны по истории. Сравнивайте профили в бэктесте только по контрольным 30% периода. Калибровка и статистика ведутся отдельно для каждого профиля.')
+    ]));
+    var waitSeg = seg(C.lifecycle.expiryOptions.map(function (b) { return [b, b + ' ' + plural(b, 'свеча', 'свечи', 'свечей')]; }), s.expiryBars, function (v) {
+      v = Number(v);
+      if (v === s.expiryBars) return;
+      App.updateSettings({ expiryBars: v }, false);
+      toast('Ожидание входа: ' + v + ' ' + plural(v, 'свеча', 'свечи', 'свечей') + ' младшего ТФ — для новых сигналов', 'good');
+      renderSettings();
+    });
+    var waitByPreset = pids.map(function (pid) { var P = C.presets[pid]; return P.short + ' (' + P.ltf + '): ' + hoursText(s.expiryBars, P.ltf); }).join(' · ');
+    root.appendChild(section('Ожидание входа', [
+      waitSeg,
+      h('ul', { class: 'why-extra' }, [
+        h('li', null, 'Сейчас: ' + s.expiryBars + ' ' + plural(s.expiryBars, 'свеча', 'свечи', 'свечей') + ' младшего ТФ — ' + waitByPreset + (s.expiryBars === C.lifecycle.expiryBars ? '. Как в промпте.' : '. В промпте — 12 свечей.')),
+        h('li', null, 'Если цена не вернулась к лимитному входу за это время, сигнал считается просроченным и сделки нет.'),
+        h('li', null, 'Дольше ждать — больше исполненных входов, но вход случается позже импульса, когда сетап уже мог устареть: часть таких входов уходит в стоп. Сравните варианты в бэктесте по контрольным 30%.'),
+        h('li', null, 'Срок применяется к новым сигналам; у уже выданных он не меняется.')
+      ])
+    ]));
     root.appendChild(section('Данные и режим', h('div', { class: 'form-grid' },
       field('Источник данных', select(srcOpts, s.source, function (e) { App.updateSettings({ source: e.target.value }, true); })),
       field('Режим сигналов', seg([['both', 'LONG и SHORT'], ['long', 'Только LONG']], s.mode, function (v) { App.updateSettings({ mode: v }, false); renderSettings(); }), '«Только LONG» — для спота'),
@@ -765,26 +993,78 @@ var UI = (function () {
       field('Тикеры через запятую (пары к ' + C.quote + ')', coinsInp, 'Если пары нет на источнике, берётся запасная: ' + C.reserveSymbols.join(', ')),
       h('div', { class: 'row-btns' },
         h('button', { type: 'button', class: 'btn primary', onclick: function () { App.setCoins(coinsInp.value); } }, 'Применить'),
-        h('button', { type: 'button', class: 'btn', onclick: function () { coinsInp.value = C.symbols.join(', '); App.setCoins(coinsInp.value); } }, 'По умолчанию'))
+        h('button', { type: 'button', class: 'btn', onclick: function () { coinsInp.value = C.symbols.join(', '); App.setCoins(coinsInp.value); } }, 'По умолчанию (10)'),
+        h('button', { type: 'button', class: 'btn', onclick: function () { coinsInp.value = C.extendedSymbols.join(', '); App.setCoins(coinsInp.value); } }, 'Расширенный (30)')),
+      h('div', { class: 'muted small' }, 'Больше монет — больше сигналов при тех же правилах. До ' + C.maxSymbols + ' монет. Монеты двигаются вместе, поэтому сигналы часто приходят пачкой.')
     ]));
     var snd = h('input', { type: 'checkbox', checked: s.sound, onchange: function (e) { App.updateSettings({ sound: e.target.checked }, false); } });
-    root.appendChild(section('Уведомления', h('div', { class: 'row-btns' },
-      h('label', { class: 'check' }, snd, h('span', null, 'Звук при новом сигнале')),
-      h('button', { type: 'button', class: 'btn small', onclick: function () { App.beep(); } }, 'Проверить звук'))));
-    var tot = Signals.Calib.totals(), cd = Signals.Calib.data;
+    var perm = App.notifyPermission();
+    var permText = {
+      granted: 'разрешены', denied: 'запрещены в браузере', 'default': 'ещё не разрешены', unsupported: 'не поддерживаются этим браузером'
+    }[perm] || perm;
+    var ntf = h('input', {
+      type: 'checkbox', checked: s.notify && perm === 'granted', disabled: perm === 'unsupported' || perm === 'denied',
+      onchange: function (e) {
+        var on = e.target.checked;
+        if (!on) { App.updateSettings({ notify: false }, false); renderSettings(); return; }
+        // Запрос разрешения — только по действию пользователя (этот клик).
+        App.requestNotify().then(function (res) {
+          if (res === 'granted') {
+            App.updateSettings({ notify: true }, false);
+            toast('Уведомления включены', 'good');
+          } else {
+            App.updateSettings({ notify: false }, false);
+            toast(res === 'denied' ? 'Браузер запретил уведомления — разрешите их в настройках сайта' : 'Уведомления не разрешены', 'bad');
+          }
+          renderSettings();
+        });
+      }
+    });
+    var ntfSt = h('input', {
+      type: 'checkbox', checked: s.notifyStatus, disabled: !(s.notify && perm === 'granted'),
+      onchange: function (e) { App.updateSettings({ notifyStatus: e.target.checked }, false); }
+    });
+    var hints = [
+      h('li', null, 'Разрешение браузера: ' + permText + '.'),
+      h('li', null, 'Уведомление приходит, когда вкладка в фоне или окно не в фокусе. Если вкладка открыта перед глазами, сработают звук и плашка внизу экрана.'),
+      h('li', null, 'Вкладка с приложением должна оставаться открытой: без своего сервера закрытая вкладка рынок не смотрит. Удобно закрепить вкладку.'),
+      h('li', null, 'На телефоне браузер усыпляет фоновые вкладки, поэтому уведомления надёжно работают только на компьютере.')
+    ];
+    if (location.protocol === 'file:') hints.push(h('li', null, 'Приложение открыто как файл. Chrome может не разрешить уведомления для файлов — тогда пользуйтесь версией на GitHub Pages (https).'));
+    if (perm === 'denied') hints.push(h('li', null, 'Чтобы включить: значок замка/настроек слева от адреса → «Уведомления» → «Разрешить», затем обновите страницу.'));
+    root.appendChild(section('Уведомления', [
+      h('div', { class: 'row-btns' },
+        h('label', { class: 'check' }, snd, h('span', null, 'Звук при новом сигнале')),
+        h('button', { type: 'button', class: 'btn small', onclick: function () { App.beep(); } }, 'Проверить звук')),
+      h('div', { class: 'row-btns' },
+        h('label', { class: 'check' }, ntf, h('span', null, 'Системное уведомление о новом сигнале'))),
+      h('div', { class: 'row-btns' },
+        h('label', { class: 'check' + (ntfSt.disabled ? ' muted' : '') }, ntfSt, h('span', null, 'Также о входе, TP1, TP2 и закрытии сделки'))),
+      perm === 'granted' ? h('div', { class: 'row-btns' },
+        h('button', { type: 'button', class: 'btn small', onclick: function () {
+          if (App.testNotify()) toast('Проверочное уведомление отправлено', 'good');
+          else toast('Не удалось показать уведомление — см. отладочный лог', 'bad');
+        } }, 'Проверить уведомление')) : null,
+      h('ul', { class: 'why-extra' }, hints)
+    ]));
+    // Калибровка — отдельно для каждого активного пресета (профиль — текущий).
     var calibBody = [];
-    if (tot.n) {
-      calibBody.push(h('div', { class: 'muted small' }, 'Обновлена ' + fDT(cd.ts) + ' · ' + cd.days + ' дн · minScore ' + cd.minScore + ' · сделок ' + tot.n + ' · общая успешность ' + Math.round(tot.s / tot.n * 100) + '%'));
-      if (tot.n < C.calibration.minTotal) calibBody.push(h('div', { class: 'note warn' }, 'Выборка мала, выводы ненадёжны: ' + tot.n + ' сделок из нужных ' + C.calibration.minTotal + '. Точность на карточках не показывается — только score с пометкой «предварительная оценка». Увеличьте период бэктеста (180 дней).'));
-      calibBody.push(tableWrap(mkTable(['Корзина', 'Сделок', 'Успешных', '%'], C.calibration.buckets.map(function (b) {
-        var x = tot.b[b];
-        return { cells: [Signals.Calib.bucketLabel(b), String(x.n), String(x.s), x.n ? Math.round(x.s / x.n * 100) + '%' : '—'] };
-      }))));
-    } else calibBody.push(h('p', { class: 'muted' }, 'Калибровки нет: точность показывается как score с пометкой «предварительная оценка».'));
-    calibBody.push(h('div', { class: 'row-btns' },
-      h('button', { type: 'button', class: 'btn primary', onclick: function () { App.calibrate(); } }, 'Откалибровать (60 дней)'),
-      tot.n ? h('button', { type: 'button', class: 'btn', onclick: function () { Signals.Calib.clear(); toast('Калибровка сброшена'); renderSettings(); } }, 'Сбросить калибровку') : null));
-    root.appendChild(section('Калибровка точности', calibBody));
+    pids.forEach(function (pid) {
+      var P = C.presets[pid], tot = Signals.Calib.totals(s.strategy, pid), cd = Signals.Calib.info(s.strategy, pid);
+      calibBody.push(h('h4', { class: 'sub-title' }, P.name));
+      if (tot.n) {
+        calibBody.push(h('div', { class: 'muted small' }, 'Обновлена ' + fDT(cd.ts) + ' · ' + cd.days + ' дн · minScore ' + cd.minScore + ' · сделок ' + tot.n + ' · общая успешность ' + Math.round(tot.s / tot.n * 100) + '%'));
+        if (tot.n < C.calibration.minTotal) calibBody.push(h('div', { class: 'note warn' }, 'Выборка мала, выводы ненадёжны: ' + tot.n + ' сделок из нужных ' + C.calibration.minTotal + '. Точность на карточках не показывается — только score с пометкой «предварительная оценка». Увеличьте период бэктеста (180 дней).'));
+        calibBody.push(tableWrap(mkTable(['Корзина', 'Сделок', 'Успешных', '%'], C.calibration.buckets.map(function (b) {
+          var x = tot.b[b];
+          return { cells: [Signals.Calib.bucketLabel(b), String(x.n), String(x.s), x.n ? Math.round(x.s / x.n * 100) + '%' : '—'] };
+        }))));
+      } else calibBody.push(h('p', { class: 'muted' }, 'Калибровки нет: точность показывается как score с пометкой «предварительная оценка».'));
+      calibBody.push(h('div', { class: 'row-btns' },
+        h('button', { type: 'button', class: 'btn primary', onclick: function () { App.calibrate(pid); } }, 'Откалибровать (60 дней)'),
+        tot.n ? h('button', { type: 'button', class: 'btn', onclick: function () { Signals.Calib.clear(s.strategy, pid); toast('Калибровка сброшена'); renderSettings(); } }, 'Сбросить') : null));
+    });
+    root.appendChild(section('Калибровка точности · профиль «' + modeName(s.strategy) + '»', calibBody));
     root.appendChild(section('Сброс сохранённых данных', h('div', { class: 'row-btns' },
       h('button', { type: 'button', class: 'btn', onclick: function () { if (confirm('Удалить журнал сигналов?')) App.resetJournal(); } }, 'Журнал сигналов'),
       h('button', { type: 'button', class: 'btn', onclick: function () { App.clearCache(); } }, 'Кэш истории'),
@@ -820,6 +1100,7 @@ var UI = (function () {
 
   return {
     init: init, show: show, update: update, isShown: isShown, renderStatus: renderStatus, toast: toast,
-    updateBtProgress: updateBtProgress, fP: fP, roundP: roundP, fDT: fDT, current: function () { return current; }
+    updateBtProgress: updateBtProgress, updateLiveCheck: updateLiveCheck,
+    fP: fP, roundP: roundP, fDT: fDT, fTime: fTime, current: function () { return current; }
   };
 })();

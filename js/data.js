@@ -188,7 +188,7 @@ var Data = (function () {
         });
       }, function (err) {
         clearTimeout(to);
-        retry(job, NetError('net', err && err.name === 'AbortError' ? 'таймаут запроса' : 'сеть недоступна или запрос заблокирован (CORS)'));
+        retry(job, NetError('net', err && err.name === 'AbortError' ? 'таймаут запроса' : 'нет связи с биржей (сеть недоступна или запрос заблокирован)'));
       });
     }
     function getJSON(url, o) {
@@ -374,6 +374,17 @@ var Data = (function () {
     }
     return next();
   }
+  // Последние count свечей (с незакрытой). Больше лимита биржи — старшая часть докачивается постранично.
+  function fetchLatest(ad, base, sym, tf, count, retries) {
+    var lim = Math.max(3, Math.min(count, ad.maxLimit));
+    return fetchKlines(ad, base, sym, tf, lim, null, retries).then(function (latest) {
+      if (count <= ad.maxLimit || !latest.length) return latest;
+      var ms = msOf(tf), firstT = latest[0].t, startT = firstT - (count - latest.length) * ms;
+      return fetchRange(ad, base, sym, tf, startT, firstT - ms).then(function (older) {
+        return mergeSorted(older, latest);
+      });
+    });
+  }
   function toRow(c) { return [c.t, c.o, c.h, c.l, c.c, c.v]; }
   function fromRow(r) { return { t: r[0], o: r[1], h: r[2], l: r[3], c: r[4], v: r[5], closed: true }; }
   function mergeSorted(a, b) {
@@ -423,14 +434,16 @@ var Data = (function () {
   // =====================================================================================
   // LIVE-ЛЕНТА: REST-опрос каждые 20 с, свечи всех монет и цены одним запросом.
   // =====================================================================================
+  // План данных символа задаёт приложение (hooks.getPlan): {tf: {count, ltf}} — какие таймфреймы держать,
+  // сколько свечей и какие из них младшие (по ним сигналы и сопровождение, опрос на каждом цикле).
   function Feed(hooks) {
-    this.hooks = hooks;           // {getSettings, onStatus, onReady, onUpdate, onLog}
+    this.hooks = hooks;           // {getSettings, getPlan, onStatus, onReady, onUpdate, onLog}
     this.gen = 0;
     this.adapter = null;
     this.base = '';
     this.coins = [];              // [{coin, sym, replaces}]
     this.extra = [];              // символы только для сопровождения открытых сигналов
-    this.raw = {};                // sym → {L, M, H, formL, full}
+    this.raw = {};                // sym → {c: {tf: свечи}, form: {tf: незакрытая}, plan, full}
     this.prices = {};
     this.btcSym = C.btcCoin + C.quote;
     this.hasBtc = false;
@@ -440,7 +453,23 @@ var Data = (function () {
     this.orderIdx = 0;
     this.status = { state: 'idle', source: '', sourceId: '', market: '', lastUpdate: 0, error: '', notes: [] };
   }
-  Feed.prototype.tf = function (key) { return C.timeframes[key === 'L' ? 'ltf' : (key === 'M' ? 'mtf' : 'htf')]; };
+  Feed.prototype.planOf = function (sym, full) {
+    var p = this.hooks.getPlan ? this.hooks.getPlan(sym, !!full) : null;
+    if (p && Object.keys(p).length) return p;
+    var t = C.timeframes, out = {};
+    out[t.ltf] = { count: C.live.load.ltf, ltf: true };
+    if (full) { out[t.mtf] = { count: C.live.load.mtf, ltf: false }; out[t.htf] = { count: C.live.load.htf, ltf: false }; }
+    return out;
+  };
+  // Самый мелкий младший ТФ среди загруженных символов — под его закрытия подстраивается опрос.
+  Feed.prototype.finestMs = function () {
+    var best = Infinity, raw = this.raw;
+    Object.keys(raw).forEach(function (sym) {
+      var p = raw[sym].plan || {};
+      Object.keys(p).forEach(function (tf) { if (p[tf].ltf) best = Math.min(best, msOf(tf)); });
+    });
+    return isFinite(best) ? best : msOf(C.timeframes.ltf);
+  };
   Feed.prototype.setStatus = function (state, error) {
     this.status.state = state;
     if (error !== undefined) this.status.error = error;
@@ -468,7 +497,8 @@ var Data = (function () {
     var self = this;
     if (gen !== this.gen) return;
     if (this.orderIdx >= this.order.length) {
-      this.setStatus('error', 'Все источники недоступны. Повтор через 30 с.');
+      var last = this.status.error ? ' (последняя ошибка — ' + this.status.error + ')' : '';
+      this.setStatus('error', 'Все источники недоступны' + last + '. Повтор через 30 с');
       this.timer = setTimeout(function () { if (gen === self.gen) { self.orderIdx = 0; self.tryInit(gen); } }, 30000);
       return;
     }
@@ -481,6 +511,7 @@ var Data = (function () {
       if (gen !== self.gen) return;
       var nm = ADAPTERS[id] ? ADAPTERS[id].name : id;
       self.log('warn', 'Источник ' + nm + ' недоступен: ' + e.message);
+      self.status.error = nm + ': ' + e.message;
       self.cancelRequests(ADAPTERS[id]);
       self.adapter = null;
       self.orderIdx++;
@@ -494,7 +525,8 @@ var Data = (function () {
     this.status.sourceId = ad.id;
     this.status.market = ad.market;
     this.status.notes = [];
-    this.setStatus('loading', '');
+    this.status.progress = '';
+    this.setStatus('loading'); // последняя ошибка остаётся видна, пока перебираем источники
     var bases = ad.bases.slice(), lastErr = null;
     function pickBase(k) {
       if (k >= bases.length) return Promise.reject(lastErr || new Error('нет связи'));
@@ -588,6 +620,7 @@ var Data = (function () {
         Object.keys(all).forEach(function (sym) { if (self.raw[sym]) self.prices[sym] = all[sym]; });
         self.status.notes = notes;
         notes.forEach(function (n) { self.log('info', n); });
+        self.lastProbe = Date.now();
         self.status.lastUpdate = now();
         self.setStatus('ok', '');
         if (self.hooks.onReady) self.hooks.onReady();
@@ -597,18 +630,17 @@ var Data = (function () {
   };
   Feed.prototype.loadSym = function (sym, full, retries) {
     var self = this, ad = this.adapter, base = this.base;
-    var keys = full ? ['L', 'M', 'H'] : ['L'];
-    var r = { L: [], M: [], H: [], formL: null, full: !!full };
-    return Promise.all(keys.map(function (key) {
-      var tf = self.tf(key);
-      return fetchKlines(ad, base, sym, tf, C.live.load[key === 'L' ? 'ltf' : (key === 'M' ? 'mtf' : 'htf')], null, retries).then(function (cds) {
+    var plan = this.planOf(sym, full);
+    var r = { c: {}, form: {}, plan: plan, full: !!full };
+    return Promise.all(Object.keys(plan).map(function (tf) {
+      return fetchLatest(ad, base, sym, tf, plan[tf].count, retries).then(function (cds) {
         var closed = cds.filter(function (c) { return c.closed; });
         var form = cds.filter(function (c) { return !c.closed; });
         if (!closed.length) throw NetError('stale', 'нет свечей ' + tf);
         var last = closed[closed.length - 1].t, ms = msOf(tf);
         if (now() - (last + ms) > 3 * ms + C.network.closeGraceMs) throw NetError('stale', 'нет свежих свечей ' + tf + ' (пара не торгуется)');
-        r[key] = closed;
-        if (key === 'L') r.formL = form.length ? form[form.length - 1] : null;
+        r.c[tf] = closed;
+        r.form[tf] = form.length ? form[form.length - 1] : null;
       });
     })).then(function () { self.raw[sym] = r; return r; });
   };
@@ -630,18 +662,21 @@ var Data = (function () {
     });
   };
   // Обновление одного ТФ символа. Возвращает число новых закрытых свечей.
-  Feed.prototype.refresh = function (sym, key) {
-    var self = this, r = this.raw[sym], tf = this.tf(key), ms = msOf(tf), arr = r[key];
+  Feed.prototype.refresh = function (sym, tf) {
+    var r = this.raw[sym], ms = msOf(tf), arr = r.c[tf] || [];
     var lastT = arr.length ? arr[arr.length - 1].t : null;
     var expected = Math.floor((now() - C.network.closeGraceMs) / ms) * ms - ms;
-    var loadN = C.live.load[key === 'L' ? 'ltf' : (key === 'M' ? 'mtf' : 'htf')];
+    var loadN = r.plan[tf] ? r.plan[tf].count : C.live.load.ltf;
     var gap = lastT === null || expected - lastT > 2 * ms;
-    return fetchKlines(this.adapter, this.base, sym, tf, gap ? loadN : 3).then(function (cds) {
-      var added = 0, form = null, cur = r[key];
+    var req = gap ? fetchLatest(this.adapter, this.base, sym, tf, loadN) : fetchKlines(this.adapter, this.base, sym, tf, 3);
+    return req.then(function (cds) {
+      var added = 0, form = null, cur = r.c[tf] || [];
       if (gap) {
         var closed = cds.filter(function (c) { return c.closed; });
         added = lastT === null ? closed.length : closed.filter(function (c) { return c.t > lastT; }).length;
-        r[key] = closed;
+        r.c[tf] = closed;
+        var f = cds.filter(function (c) { return !c.closed; });
+        form = f.length ? f[f.length - 1] : null;
       } else {
         cds.forEach(function (c) {
           if (!c.closed) { form = c; return; }
@@ -651,19 +686,19 @@ var Data = (function () {
             if (k >= 0) cur[k] = c;
           }
         });
+        r.c[tf] = cur;
       }
-      if (gap) { var f = cds.filter(function (c) { return !c.closed; }); form = f.length ? f[f.length - 1] : null; }
-      var keep = C.live.keep[key === 'L' ? 'ltf' : (key === 'M' ? 'mtf' : 'htf')];
-      if (r[key].length > keep) r[key].splice(0, r[key].length - keep);
-      if (key === 'L') r.formL = form;
+      var keep = loadN + 200;
+      if (r.c[tf].length > keep) r.c[tf].splice(0, r.c[tf].length - keep);
+      r.form[tf] = form;
       return added;
     });
   };
-  Feed.prototype.refreshIfDue = function (sym, key) {
-    var r = this.raw[sym], tf = this.tf(key), ms = msOf(tf), arr = r[key];
+  Feed.prototype.refreshIfDue = function (sym, tf) {
+    var r = this.raw[sym], ms = msOf(tf), arr = r.c[tf] || [];
     var expected = Math.floor((now() - C.network.closeGraceMs) / ms) * ms - ms;
     if (arr.length && arr[arr.length - 1].t >= expected) return Promise.resolve(0);
-    return this.refresh(sym, key);
+    return this.refresh(sym, tf);
   };
   Feed.prototype.tickerSyms = function () {
     return this.adapter && this.adapter.id === 'binanceSpot' ? this.allSyms() : null;
@@ -672,7 +707,7 @@ var Data = (function () {
     var self = this;
     if (gen !== this.gen) return;
     if (this.timer) clearTimeout(this.timer);
-    var ms = msOf(C.timeframes.ltf), t = now();
+    var ms = this.finestMs(), t = now();
     var nextClose = Math.floor(t / ms) * ms + ms + C.network.closeGraceMs + 400;
     var delay = Math.max(1000, Math.min(C.network.pollMs, nextClose - t));
     this.timer = setTimeout(function () { self.cycle(gen); }, delay);
@@ -690,10 +725,27 @@ var Data = (function () {
       c.tries = (c.tries || 0) + 1;
       return self.loadSym(c.sym, true, 1).then(function () {
         c.pending = false;
-        closedNew[c.sym] = C.live.catchUpBars;
+        closedNew[c.sym] = { _reload: true }; // приложение прогонит догрузку последних свечей
         self.log('info', c.coin + ': данные догружены');
       }, function (e) { self.log('warn', c.coin + ': ' + e.message); });
     }));
+  };
+  // В режиме «Авто» после сбоя лента работает на резервном источнике. Раз в 10 минут проверяем,
+  // ответил ли более приоритетный источник, и если да — возвращаемся к нему.
+  Feed.prototype.probePreferred = function (gen) {
+    var self = this, s = this.hooks.getSettings();
+    if (s.source !== 'auto' || !this.adapter) return;
+    var curIdx = C.sourceOrder.indexOf(this.adapter.id);
+    if (curIdx <= 0) return;
+    var t = Date.now();
+    if (this.lastProbe && t - this.lastProbe < C.network.preferProbeMs) return;
+    this.lastProbe = t;
+    var pref = ADAPTERS[C.sourceOrder[0]];
+    Net.getJSON(pref.time(pref.bases[0]), { weight: 1, budget: pref.budget, retries: 0 }).then(function (j) {
+      if (gen !== self.gen || !(pref.parseTime(j) > 0)) return;
+      self.log('info', 'Источник ' + pref.name + ' снова доступен — возвращаюсь к нему');
+      self.start(0);
+    }, function () { /* приоритетный источник всё ещё недоступен — остаёмся на текущем */ });
   };
   // Внеочередной опрос (например, при возврате на вкладку).
   Feed.prototype.kick = function () {
@@ -710,14 +762,20 @@ var Data = (function () {
     fetchTickers(this.adapter, this.base, this.tickerSyms()).then(function (tick) {
       Object.keys(tick).forEach(function (sym) { if (self.raw[sym]) self.prices[sym] = tick[sym]; });
     }, function (e) { errors.push('цены: ' + e.message); }).then(function () {
+      // Младшие ТФ плана опрашиваются каждый цикл (новые закрытия и незакрытая свеча), старшие — когда пора.
       return Promise.all(syms.map(function (sym) {
         var r = self.raw[sym];
         if (!r) return null;
-        return self.refresh(sym, 'L').then(function (n) {
-          closedNew[sym] = n;
-          if (!r.full) return null;
-          return self.refreshIfDue(sym, 'M').then(function () { return self.refreshIfDue(sym, 'H'); });
-        }).then(null, function (e) { errors.push(sym + ': ' + e.message); });
+        var plan = r.plan || {}, out = {};
+        closedNew[sym] = out;
+        var tfs = Object.keys(plan).sort(function (a, b) { return msOf(a) - msOf(b); });
+        var chain = Promise.resolve();
+        tfs.forEach(function (tf) {
+          chain = chain.then(function () {
+            return (plan[tf].ltf ? self.refresh(sym, tf) : self.refreshIfDue(sym, tf)).then(function (n) { out[tf] = n; });
+          });
+        });
+        return chain.then(null, function (e) { errors.push(sym + ': ' + e.message); });
       }));
     }).then(function () {
       return self.loadPending(closedNew);
@@ -733,6 +791,7 @@ var Data = (function () {
         if (self.hooks.onUpdate) self.hooks.onUpdate({ closedNew: closedNew });
       } catch (e2) { self.log('error', 'Ошибка обработки данных: ' + e2.message); }
       self.schedule(gen);
+      self.probePreferred(gen);
     }).then(null, function (e) {
       self.busy = false;
       if (gen !== self.gen) return;
@@ -751,7 +810,7 @@ var Data = (function () {
 
   return {
     now: now, sleep: sleep, Store: Store, Cache: Cache, Net: Net, NetError: NetError, ADAPTERS: ADAPTERS,
-    normalize: normalize, fetchKlines: fetchKlines, fetchRange: fetchRange, fetchTickers: fetchTickers,
+    normalize: normalize, fetchKlines: fetchKlines, fetchRange: fetchRange, fetchLatest: fetchLatest, fetchTickers: fetchTickers,
     fetchTime: fetchTime, loadHistory: loadHistory, Feed: Feed, setClock: setClock
   };
 })();

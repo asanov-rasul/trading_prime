@@ -35,7 +35,7 @@ var Backtest = (function () {
   function cancel() { if (job) job.cancel = true; }
   function isRunning() { return !!job; }
 
-  // opts: {adapter, base, coins:[{coin,sym}], hasBtc, days, presetId, minScore, feePct, slipPct, longOnly}
+  // opts: {adapter, base, coins:[{coin,sym}], hasBtc, days, presetId, minScore, feePct, slipPct, longOnly, mode, expiryBars}
   function run(opts, onProgress) {
     if (job) return Promise.reject(new Error('бэктест уже идёт'));
     job = { cancel: false };
@@ -45,6 +45,10 @@ var Backtest = (function () {
 
   function runInner(opts, onProgress, my) {
     var P = C.presets[opts.presetId] || C.presets.main;
+    // Профиль: запрошенный и фактический для пресета (в частом профиле скальп идёт по мягким правилам — как в live).
+    var reqMode = C.strategyModes[opts.mode] ? opts.mode : 'strict';
+    var mode = profileFor(reqMode, P.id), K = configFor(mode);
+    var expiryBars = opts.expiryBars > 0 ? Math.round(opts.expiryBars) : C.lifecycle.expiryBars; // ожидание входа, свечей LTF
     var ms = { L: SMC.tfMs(P.ltf), M: SMC.tfMs(P.mtf), H: SMC.tfMs(P.htf) };
     var nowT = Data.now();
     var endT = Math.floor((nowT - C.network.closeGraceMs) / ms.L) * ms.L - ms.L; // открытие последней закрытой свечи
@@ -134,7 +138,7 @@ var Backtest = (function () {
             if (my.cancel) return Promise.reject(new Error('отменено'));
             var cd = S.L.c[i];
             if (st.open) {
-              Signals.step(st.open, cd, C);
+              Signals.step(st.open, cd, K);
               if (!Signals.isOpen(st.open)) {
                 if (st.open.outcome === 'sl') st.lastSl = st.open.closedT;
                 sigs.push(st.open);
@@ -142,7 +146,7 @@ var Backtest = (function () {
               }
             }
             var ctx = SMC.makeContext({
-              sym: S.sym, coin: S.coin, L: S.L, M: S.M, H: S.H, i: i, btc: btcHere, cfg: C,
+              sym: S.sym, coin: S.coin, L: S.L, M: S.M, H: S.H, i: i, btc: btcHere, cfg: K,
               longOnly: opts.longOnly, memo: memo, btcMemo: btcMemo
             });
             var res = SMC.detect(ctx);
@@ -158,12 +162,12 @@ var Backtest = (function () {
               rej('score', REASON_TEXT.score);
             } else {
               var raw = { L: S.L.c, M: S.M.c, H: S.H.c, ms: ms, evalT: ctx.T, price: cd.c };
-              var v = Signals.validate(res.cand, raw, state);
+              var v = Signals.validate(res.cand, raw, state, K);
               if (!v.ok) {
                 funnelDrop('validator');
                 rej('v:' + v.code + ':' + v.reason, 'валидатор: ' + v.reason);
               } else {
-                st.open = Signals.create(res.cand, { fee: feeF, slip: slipF, ltfMs: ms.L, source: opts.adapter.id, preset: P.id });
+                st.open = Signals.create(res.cand, { fee: feeF, slip: slipF, ltfMs: ms.L, source: opts.adapter.id, preset: P.id, mode: mode, expiryBars: expiryBars });
               }
             }
             i++;
@@ -200,24 +204,30 @@ var Backtest = (function () {
         function tfText(t) { return t.replace(/1H/g, mtfName); }
         FUNNEL.forEach(function (f, k) {
           if (k > 0) (f.drop || []).forEach(function (code) { left -= (dropCount[code] || 0); });
-          fun.push({ label: tfText(f.label), n: left });
+          var label = f.label;
+          if (f.key === 'sweep' && !K.require.sweep) label = 'sweep (в этом профиле не обязателен)';
+          if (f.key === 'poi' && K.poi.optional) label = 'зона 1H (в этом профиле не обязательна)';
+          if (f.key === 'entry' && K.pdRange === 'mtf') label = 'вход в Discount/Premium диапазона 1H';
+          fun.push({ label: tfText(label), n: left });
         });
         Object.keys(rejects).forEach(function (key) { rejects[key].text = tfText(rejects[key].text); });
         var meta = {
           presetId: P.id, presetName: P.name, days: opts.days, startT: startT, endT: endT + ms.L,
           minScore: opts.minScore, feePct: opts.feePct, slipPct: opts.slipPct, longOnly: !!opts.longOnly,
-          coins: covered, source: opts.adapter.name, ts: Date.now(), tf: P
+          coins: covered, source: opts.adapter.name, ts: Date.now(), tf: P,
+          mode: mode, requestedMode: reqMode, modeName: C.strategyModes[mode].name, expiryBars: expiryBars
         };
         var result = aggregate(all, meta);
         result.funnel = fun;
         result.rejects = Object.keys(rejects).map(function (k) { return { text: rejects[k].text, n: rejects[k].n }; })
           .sort(function (a, b) { return b.n - a.n; });
         result.warnings = warnings;
-        if (P.id === 'main' && covered.length) {
-          Signals.Calib.update(all, covered, { ts: meta.ts, days: opts.days, minScore: opts.minScore, preset: P.id });
+        // readOnly — прогон для проверки live-настроек: калибровку и сравнение вариантов не трогаем.
+        if (covered.length && !opts.readOnly) { // калибровка своя для каждого пресета и профиля
+          Signals.Calib.update(all, covered, { ts: meta.ts, days: opts.days, minScore: opts.minScore, preset: P.id, mode: mode, expiryBars: expiryBars });
           result.calibrated = true;
         }
-        savePresetCompare(result);
+        if (!opts.readOnly) savePresetCompare(result);
         prog('done', 1, 'Готово');
         return result;
       });
@@ -242,13 +252,78 @@ var Backtest = (function () {
     return { meta: meta, signals: all, summary: summary, byCoin: byCoin, byBucket: byBucket, split: split };
   }
 
+  // ---------- проверка live-настроек: несколько пресетов вместе ----------
+  // Объединение прогонов пресетов по правилам live: по монете одновременно открыт один сигнал (при равном
+  // времени первым идёт пресет из начала order), пауза после SL общая для монеты. Это приближение: пресеты
+  // прогоняются по отдельности, поэтому сигнал, который в live не появился бы из-за чужого открытого,
+  // мог занять место другого сигнала своего пресета.
+  function mergeLive(lists, order, cooldownBars) {
+    var prio = {}, all = [], busy = {}, lastSl = {}, kept = [];
+    order.forEach(function (pid, k) { prio[pid] = k; });
+    lists.forEach(function (l) { l.forEach(function (s) { all.push(s); }); });
+    all.sort(function (a, b) { return (a.createdT - b.createdT) || ((prio[a.preset] || 0) - (prio[b.preset] || 0)); });
+    all.forEach(function (s) {
+      var key = s.sym || s.coin;
+      if (busy[key] != null && busy[key] > s.createdT) return;
+      if (lastSl[key] != null && s.createdT - lastSl[key] <= cooldownBars * s.ltfMs) return;
+      kept.push(s);
+      busy[key] = s.closedT != null ? s.closedT : Infinity;
+      if (s.outcome === 'sl' && s.closedT != null) lastSl[key] = s.closedT;
+    });
+    return kept;
+  }
+  // Сигналы и входы по календарным дням (местное время): только полные дни внутри [fromT, toT).
+  function countByDay(list, fromT, toT) {
+    var days = [], d = new Date(fromT);
+    d.setHours(0, 0, 0, 0);
+    if (d.getTime() < fromT) d.setDate(d.getDate() + 1);
+    for (var guard = 0; guard < 400; guard++) {
+      var t0 = d.getTime();
+      d.setDate(d.getDate() + 1);
+      if (d.getTime() > toT) break;
+      days.push({ t: t0, end: d.getTime(), n: 0, e: 0 });
+    }
+    list.forEach(function (s) {
+      for (var k = 0; k < days.length; k++) {
+        if (s.createdT >= days[k].t && s.createdT < days[k].end) {
+          days[k].n++;
+          if (s.filledT != null) days[k].e++;
+          break;
+        }
+      }
+    });
+    return days;
+  }
+  // Итог проверки: сигналы в день по полным дням и результат сделок за весь период.
+  function liveSummary(kept, fromT, toT) {
+    var days = countByDay(kept, fromT, toT), nd = days.length;
+    var sumN = 0, sumE = 0, ge3 = 0, zero = 0, min = Infinity, max = 0;
+    days.forEach(function (x) {
+      sumN += x.n; sumE += x.e;
+      if (x.n >= 3) ge3++;
+      if (x.n === 0) zero++;
+      if (x.n < min) min = x.n;
+      if (x.n > max) max = x.n;
+    });
+    var agg = aggregate(kept.slice(), { startT: fromT, endT: toT, coins: [] });
+    return {
+      days: days.map(function (x) { return { t: x.t, n: x.n, e: x.e }; }), nDays: nd,
+      avg: nd ? sumN / nd : NaN, avgEntries: nd ? sumE / nd : NaN, ge3: ge3, zero: zero,
+      min: nd ? min : NaN, max: nd ? max : NaN, summary: agg.summary, split: agg.split
+    };
+  }
+
   function savePresetCompare(result) {
     var list = Data.Store.get(C.storage.presets, []);
     if (!Array.isArray(list)) list = [];
     var o = result.split.outS, m = result.meta;
-    list = list.filter(function (x) { return !(x && x.presetId === m.presetId && x.days === m.days); });
+    list = list.filter(function (x) {
+      return !(x && x.presetId === m.presetId && x.days === m.days && (x.mode || 'strict') === m.mode &&
+        (x.expiryBars || C.lifecycle.expiryBars) === m.expiryBars);
+    });
     list.push({
       presetId: m.presetId, presetName: m.presetName, days: m.days, ts: m.ts, minScore: m.minScore,
+      mode: m.mode, modeName: m.modeName, expiryBars: m.expiryBars,
       n: o.n, winRate: o.winRate, avgR: o.avgR, pf: o.pf, sumR: o.sumR
     });
     list.sort(function (a, b) { return b.ts - a.ts; });
@@ -262,13 +337,13 @@ var Backtest = (function () {
       return /[",\n;]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     }
     function num(x, d) { return (typeof x === 'number' && isFinite(x)) ? x.toFixed(d) : ''; }
-    var head = ['created_local', 'coin', 'side', 'score', 'entry', 'sl', 'tp1', 'tp2', 'tp3', 'status', 'outcome', 'success', 'result_R', 'filled_local', 'closed_local'];
+    var head = ['created_local', 'coin', 'side', 'mode', 'wait_bars', 'score', 'entry', 'sl', 'tp1', 'tp2', 'tp3', 'status', 'outcome', 'success', 'result_R', 'filled_local', 'closed_local'];
     var rows = [head.join(',')];
     function dt(t) { return t ? new Date(t).toLocaleString('ru-RU') : ''; }
     signals.forEach(function (s) {
       var dec = s.entry >= 100 ? 2 : (s.entry >= 1 ? 4 : 6);
       rows.push([
-        q(dt(s.createdT)), q(s.coin), s.side, s.score,
+        q(dt(s.createdT)), q(s.coin), s.side, s.mode || 'strict', s.expiryBars || C.lifecycle.expiryBars, s.score,
         num(s.entry, dec), num(s.sl, dec), num(s.tp1, dec), num(s.tp2, dec), num(s.tp3, dec),
         s.status, q(Signals.OUTCOME[s.outcome] || ''), s.status === 'closed' ? (s.tpHit[0] ? '1' : '0') : '',
         num(s.resultR, 3), q(dt(s.filledT)), q(dt(s.closedT))
@@ -277,5 +352,8 @@ var Backtest = (function () {
     return '﻿' + rows.join('\n');
   }
 
-  return { run: run, cancel: cancel, isRunning: isRunning, toCSV: toCSV, aggregate: aggregate, FUNNEL: FUNNEL };
+  return {
+    run: run, cancel: cancel, isRunning: isRunning, toCSV: toCSV, aggregate: aggregate, FUNNEL: FUNNEL,
+    mergeLive: mergeLive, countByDay: countByDay, liveSummary: liveSummary
+  };
 })();

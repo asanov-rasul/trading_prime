@@ -7,9 +7,10 @@
   <meta name="color-scheme" content="dark">
   <!-- Сетевые обращения разрешены только к публичным API бирж. -->
   <meta http-equiv="Content-Security-Policy" content="connect-src https://fapi.binance.com https://api.binance.com https://data-api.binance.vision https://api.bybit.com; object-src 'none'; base-uri 'none'; form-action 'none'">
-  <meta name="description" content="SMC Signals — торговые сигналы Smart Money Concepts по 10 монетам. Только подсказки, без торговли и ключей.">
+  <meta name="description" content="SMC Signals — торговые сигналы Smart Money Concepts по криптовалютам. Только подсказки, без торговли и ключей.">
   <title>SMC Signals</title>
-  <link rel="stylesheet" href="style.css">
+  <!-- ?v=… — метка версии: после обновления файлов браузер не возьмёт старые из кэша. Меняйте вместе с CONFIG.version. -->
+  <link rel="stylesheet" href="style.css?v=1.4.0">
 </head>
 <body>
   <header class="topbar">
@@ -51,13 +52,13 @@
 
   <div id="toast" class="toast" role="alert" hidden></div>
 
-  <script src="js/config.js"></script>
-  <script src="js/data.js"></script>
-  <script src="js/smc.js"></script>
-  <script src="js/signals.js"></script>
-  <script src="js/backtest.js"></script>
-  <script src="js/calc.js"></script>
-  <script src="js/ui.js"></script>
-  <script src="js/main.js"></script>
+  <script src="js/config.js?v=1.4.0"></script>
+  <script src="js/data.js?v=1.4.0"></script>
+  <script src="js/smc.js?v=1.4.0"></script>
+  <script src="js/signals.js?v=1.4.0"></script>
+  <script src="js/backtest.js?v=1.4.0"></script>
+  <script src="js/calc.js?v=1.4.0"></script>
+  <script src="js/ui.js?v=1.4.0"></script>
+  <script src="js/main.js?v=1.4.0"></script>
 </body>
 </html>

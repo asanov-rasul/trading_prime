@@ -17,9 +17,12 @@ var App = (function () {
     return {
       source: 'auto', mode: 'both', minScore: C.minScore, riskPct: C.calculator.riskPct,
       feeFutures: C.fees.futures, feeSpot: C.fees.spot, slipPct: C.slippagePct,
-      symbols: C.symbols.slice(), sound: true
+      symbols: C.symbols.slice(), sound: true, strategy: C.defaultStrategy, expiryBars: C.lifecycle.expiryBars,
+      notify: false, notifyStatus: false, livePreset: C.defaultPreset
     };
   }
+  // Таймфреймы live-сигналов: один пресет или все три сразу.
+  var LIVE_PRESETS = ['main', 'swing', 'scalp', 'all'];
   function numIn(v, lo, hi, def) { return (typeof v === 'number' && isFinite(v) && v >= lo && v <= hi) ? v : def; }
   function sanitize(s) {
     var d = defaults(), o = {};
@@ -33,7 +36,39 @@ var App = (function () {
     o.symbols = Array.isArray(s.symbols) ? s.symbols.filter(function (x) { return typeof x === 'string' && /^[A-Z0-9]{2,15}$/.test(x); }) : d.symbols;
     if (!o.symbols.length) o.symbols = d.symbols;
     o.sound = s.sound !== false;
+    o.notify = s.notify === true;
+    o.notifyStatus = s.notifyStatus === true;
+    o.strategy = C.strategyModes[s.strategy] ? s.strategy : d.strategy;
+    o.expiryBars = C.lifecycle.expiryOptions.indexOf(s.expiryBars) >= 0 ? s.expiryBars : d.expiryBars;
+    o.livePreset = LIVE_PRESETS.indexOf(s.livePreset) >= 0 ? s.livePreset : d.livePreset;
     return o;
+  }
+  // Окно догрузки при старте: сигнал старше срока ожидания входа уже не может ждать вход.
+  function catchUpBars() { return Math.max(C.live.catchUpBars, app.settings.expiryBars); }
+  // Активные пресеты live-режима. «Все сразу» — основной, свинг и скальп параллельно (основной первым).
+  function activePresets() { return app.settings.livePreset === 'all' ? ['main', 'swing', 'scalp'] : [app.settings.livePreset]; }
+  function primaryPreset() { return activePresets()[0]; }
+  // Сколько свечей держать по роли ТФ: младший — окно + догрузка; средний — окно и 30 дней для оценки
+  // волатильности; старший — окно и прогрев EMA200.
+  function loadCount(role, tf) {
+    if (role === 'ltf') return Math.max(C.live.load.ltf, C.windows.ltf + catchUpBars() + 40);
+    if (role === 'mtf') return Math.max(C.windows.mtf + 60, Math.ceil(C.lowVol.days * SMC.DAY / SMC.tfMs(tf)) + 60);
+    return C.windows.htf + C.emaWarmupBars + 20;
+  }
+  // План данных: объединение таймфреймов пресетов (+ младшие ТФ открытых сигналов) с максимумом свечей.
+  function tfPlanFor(presetIds, openLtfs) {
+    var plan = {};
+    function want(tf, role) {
+      var x = plan[tf] || (plan[tf] = { count: 0, ltf: false });
+      x.count = Math.max(x.count, loadCount(role, tf));
+      if (role === 'ltf') x.ltf = true;
+    }
+    presetIds.forEach(function (pid) { var P = C.presets[pid]; want(P.ltf, 'ltf'); want(P.mtf, 'mtf'); want(P.htf, 'htf'); });
+    (openLtfs || []).forEach(function (tf) { want(tf, 'ltf'); });
+    return plan;
+  }
+  function openLtfsOf(sym) {
+    return Signals.Journal.openFor(sym).map(function (s) { return s.tf && s.tf.ltf; }).filter(function (tf) { return !!SMC.TF_MS[tf]; });
   }
   function loadSettings() {
     var s = Store.get(C.storage.settings, {});
@@ -57,92 +92,127 @@ var App = (function () {
   // ---------- серии и контекст ----------
   function coinOf(sym) { return sym.slice(0, sym.length - C.quote.length); }
   function isActive(sym) { return !!feed && feed.coins.some(function (c) { return c.sym === sym; }); }
+  // Серии по каждому загруженному таймфрейму: app.series[sym][tf].
   function buildAllSeries() {
     var out = {};
     Object.keys(feed.raw).forEach(function (sym) {
       var r = feed.raw[sym];
-      if (!r || !r.L || !r.L.length) return;
-      out[sym] = {
-        L: SMC.buildSeries(r.L, C.timeframes.ltf, C),
-        M: r.M && r.M.length ? SMC.buildSeries(r.M, C.timeframes.mtf, C) : null,
-        H: r.H && r.H.length ? SMC.buildSeries(r.H, C.timeframes.htf, C) : null
-      };
+      if (!r || !r.c) return;
+      var S = {};
+      Object.keys(r.c).forEach(function (tf) { if (r.c[tf] && r.c[tf].length) S[tf] = SMC.buildSeries(r.c[tf], tf, C); });
+      out[sym] = S;
     });
     app.series = out;
   }
-  function makeCtx(sym, idx) {
-    var S = app.series[sym], B = feed.hasBtc ? app.series[feed.btcSym] : null;
+  function presetSeries(sym, pid) {
+    var S = app.series[sym], P = C.presets[pid];
+    if (!S) return null;
+    return { L: S[P.ltf] || null, M: S[P.mtf] || null, H: S[P.htf] || null };
+  }
+  function makeCtx(sym, pid, idx) {
+    var P = C.presets[pid], X = presetSeries(sym, pid), B = feed.hasBtc ? app.series[feed.btcSym] : null;
     return SMC.makeContext({
-      sym: sym, coin: coinOf(sym), L: S.L, M: S.M, H: S.H, i: idx,
-      btc: (B && B.M && B.H) ? { M: B.M, H: B.H } : null,
-      cfg: C, longOnly: app.settings.mode === 'long', memo: null
+      sym: sym, coin: coinOf(sym), L: X.L, M: X.M, H: X.H, i: idx,
+      btc: (B && B[P.mtf] && B[P.htf]) ? { M: B[P.mtf], H: B[P.htf] } : null,
+      cfg: configFor(profileFor(app.settings.strategy, pid)), longOnly: app.settings.mode === 'long', memo: null
     });
   }
+  // Обзор монет (тренд, стадия) — по главному из активных пресетов.
   function updateOverviews() {
-    var out = {};
+    var out = {}, pid = primaryPreset();
     feed.coins.forEach(function (c) {
-      var S = app.series[c.sym];
-      if (!S || !S.M || !S.H || S.L.c.length < 3) return;
-      try { out[c.sym] = SMC.overview(makeCtx(c.sym, S.L.c.length - 1), app.priceOf(c.sym)); } catch (e) { /* обзор не критичен */ }
+      var X = presetSeries(c.sym, pid);
+      if (!X || !X.L || !X.M || !X.H || X.L.c.length < 3) return;
+      try { out[c.sym] = SMC.overview(makeCtx(c.sym, pid, X.L.c.length - 1), app.priceOf(c.sym)); } catch (e) { /* обзор не критичен */ }
     });
     app.overview = out;
   }
 
   // ---------- обработка закрытых свечей ----------
-  // Для каждой новой закрытой свечи: сопровождение открытых сигналов, затем детектор и валидатор.
-  function processSymbol(sym, newCount, live) {
-    var S = app.series[sym];
-    if (!S || !S.L) return [];
-    var Lc = S.L.c, n = Lc.length, created = [];
-    var start = Math.max(0, n - newCount);
-    var canDetect = isActive(sym) && S.M && S.H;
-    var detectFrom = Math.max(start, n - C.live.catchUpBars);
+  // Сопровождение открытых сигналов символа на свече cd их младшего ТФ (tf).
+  // isNews — событие на последней свече обычного опроса: о нём можно уведомить.
+  function stepSignalsOn(sym, tf, cd, isNews) {
     var coin = coinOf(sym);
+    Signals.Journal.openFor(sym).forEach(function (sig) {
+      if (!sig.tf || sig.tf.ltf !== tf) return;
+      var before = sig.status, hitBefore = sig.tpHit.slice();
+      Signals.step(sig, cd, C);
+      if (before === 'pending' && sig.status === 'active') {
+        log('info', coin + ' ' + sig.side + ': вход по ' + UI.fP(sig.entry));
+        if (isNews) notifyStatus(sig, 'вход исполнен по ' + UI.fP(sig.entry));
+      }
+      if (Signals.isOpen(sig) && sig.tpHit[0] && !hitBefore[0] && isNews) notifyStatus(sig, 'TP1 взят, стоп перенесён в безубыток');
+      if (Signals.isOpen(sig) && sig.tpHit[1] && !hitBefore[1] && isNews) notifyStatus(sig, 'TP2 взят, стоп перенесён на TP1');
+      if (!Signals.isOpen(sig)) {
+        Signals.Journal.noteClosed(sig);
+        var resTxt = Signals.statusText(sig) + (sig.resultR !== null ? ' (' + (sig.resultR >= 0 ? '+' : '') + sig.resultR.toFixed(2) + 'R)' : '');
+        log('info', coin + ' ' + sig.side + ': ' + resTxt);
+        if (isNews && !sig.late) notifyStatus(sig, resTxt);
+      }
+    });
+  }
+  // Для каждой новой закрытой свечи младшего ТФ пресета: сопровождение сигналов на этом ТФ, затем детектор
+  // и валидатор с таймфреймами пресета. fresh — вызов из обычного опроса.
+  function processPreset(sym, pid, newCount, live, fresh) {
+    var X = presetSeries(sym, pid), P = C.presets[pid];
+    if (!X || !X.L) return [];
+    var Lc = X.L.c, n = Lc.length, created = [];
+    var start = Math.max(0, n - newCount);
+    var canDetect = isActive(sym) && X.M && X.H;
+    var detectFrom = Math.max(start, n - catchUpBars());
+    var coin = coinOf(sym), tag = activePresets().length > 1 ? ' [' + P.short + ']' : '';
     for (var idx = start; idx < n; idx++) {
       var cd = Lc[idx];
-      Signals.Journal.openFor(sym).forEach(function (sig) {
-        var before = sig.status;
-        Signals.step(sig, cd, C);
-        if (before === 'pending' && sig.status === 'active') log('info', coin + ' ' + sig.side + ': вход по ' + UI.fP(sig.entry));
-        if (!Signals.isOpen(sig)) {
-          Signals.Journal.noteClosed(sig);
-          log('info', coin + ' ' + sig.side + ': ' + Signals.statusText(sig) + (sig.resultR !== null ? ' (' + (sig.resultR >= 0 ? '+' : '') + sig.resultR.toFixed(2) + 'R)' : ''));
-        }
-      });
+      stepSignalsOn(sym, P.ltf, cd, !!fresh && idx === n - 1);
       if (!canDetect || idx < detectFrom) continue;
-      var ctx = makeCtx(sym, idx), res;
-      try { res = SMC.detect(ctx); } catch (e) { log('error', coin + ': ошибка детектора — ' + e.message); continue; }
+      var ctx = makeCtx(sym, pid, idx), res;
+      try { res = SMC.detect(ctx); } catch (e) { log('error', coin + tag + ': ошибка детектора — ' + e.message); continue; }
       var when = UI.fDT(ctx.T);
       if (!res.cand) {
-        if (LOG_STAGES[res.code]) log('debug', coin + ' ' + when + ': кандидат ' + (res.dir === 1 ? 'LONG' : 'SHORT') + ' отброшен детектором — ' + res.reason);
+        if (LOG_STAGES[res.code]) log('debug', coin + tag + ' ' + when + ': кандидат ' + (res.dir === 1 ? 'LONG' : 'SHORT') + ' отброшен детектором — ' + res.reason);
         continue;
       }
       var cand = res.cand;
       if (cand.score < app.settings.minScore) {
-        log('debug', coin + ' ' + when + ': ' + cand.side + ' score ' + cand.score + ' ниже порога ' + app.settings.minScore);
+        log('debug', coin + tag + ' ' + when + ': ' + cand.side + ' score ' + cand.score + ' ниже порога ' + app.settings.minScore);
         continue;
       }
       var latest = live && idx === n - 1;
       var raw = {
-        L: Lc, M: S.M.c, H: S.H.c, ms: { L: S.L.ms, M: S.M.ms, H: S.H.ms }, evalT: ctx.T,
+        L: Lc, M: X.M.c, H: X.H.c, ms: { L: X.L.ms, M: X.M.ms, H: X.H.ms }, evalT: ctx.T,
         price: latest ? app.priceOf(sym) : cd.c
       };
       var v;
-      try { v = Signals.validate(cand, raw, Signals.Journal); } catch (e2) { v = { ok: false, reason: 'ошибка валидатора: ' + e2.message }; }
+      try { v = Signals.validate(cand, raw, Signals.Journal, ctx.cfg); } catch (e2) { v = { ok: false, reason: 'ошибка валидатора: ' + e2.message }; }
       if (!v.ok) {
-        log('reject', coin + ' ' + when + ': ' + cand.side + ' (score ' + cand.score + ') отклонён валидатором — ' + v.reason);
+        log('reject', coin + tag + ' ' + when + ': ' + cand.side + ' (score ' + cand.score + ') отклонён валидатором — ' + v.reason);
         continue;
       }
       var sig = Signals.create(cand, {
-        fee: marketFee() / 100, slip: app.settings.slipPct / 100, ltfMs: S.L.ms,
-        source: feed.status.source, preset: 'main', late: !latest
+        fee: marketFee() / 100, slip: app.settings.slipPct / 100, ltfMs: X.L.ms,
+        source: feed.status.source, preset: pid, late: !latest, mode: ctx.cfg.strategy,
+        expiryBars: app.settings.expiryBars
       });
       if (Signals.Journal.add(sig)) {
         created.push(sig);
-        log('signal', coin + ' ' + when + ': новый сигнал ' + sig.side + ', score ' + sig.score + ', вход ' + UI.fP(sig.entry) + ', SL ' + UI.fP(sig.sl) + ', TP3 ' + UI.fP(sig.tp3));
+        log('signal', coin + ' ' + when + ': новый сигнал ' + sig.side + ' (пресет ' + P.short + ', ' + C.strategyModes[sig.mode].short + ' профиль), score ' + sig.score + ', вход ' + UI.fP(sig.entry) + ', SL ' + UI.fP(sig.sl) + ', TP3 ' + UI.fP(sig.tp3));
       }
     }
     return created;
+  }
+  // Сопровождение сигналов на младших ТФ, которые сейчас не ведёт ни один активный пресет
+  // (например, сигнал скальпа после переключения на основной пресет).
+  function processLeftovers(sym, newByTf, fresh) {
+    var S = app.series[sym], used = {}, tfs = {};
+    if (!S) return;
+    activePresets().forEach(function (pid) { used[C.presets[pid].ltf] = true; });
+    Signals.Journal.openFor(sym).forEach(function (sig) { if (sig.tf && !used[sig.tf.ltf]) tfs[sig.tf.ltf] = true; });
+    Object.keys(tfs).forEach(function (tf) {
+      var ser = S[tf], cnt = newByTf ? (newByTf[tf] || 0) : 0;
+      if (!ser || cnt <= 0) return;
+      var c = ser.c, n = c.length;
+      for (var k = Math.max(0, n - cnt); k < n; k++) stepSignalsOn(sym, tf, c[k], !!fresh && k === n - 1);
+    });
   }
   // Сигналы, найденные задним числом и уже завершившиеся до показа, в журнал не попадают.
   function dropFinishedLate(created) {
@@ -160,8 +230,57 @@ var App = (function () {
       if (sig.late) return;
       UI.toast('Новый сигнал: ' + sig.coin + ' ' + sig.side + ' · score ' + sig.score, 'good');
       if (app.settings.sound) app.beep();
+      if (app.settings.notify) {
+        pushNotify('Новый сигнал: ' + sig.coin + ' ' + sig.side + ' · score ' + sig.score,
+          'Лимит ' + UI.fP(sig.entry) + ' · SL ' + UI.fP(sig.sl) + ' · TP1 ' + UI.fP(sig.tp1) + ' · TP3 ' + UI.fP(sig.tp3) +
+          '. Ждём вход до ' + UI.fTime(sig.expiresT) + '. Профиль: ' + C.strategyModes[sig.mode].short + '.',
+          'smc-' + sig.id, false);
+      }
     });
   }
+
+  // ---------- системные уведомления ----------
+  // Показываются, когда вкладка в фоне или окно не в фокусе; на открытой вкладке хватает плашки и звука.
+  function notifySupported() { return typeof window.Notification === 'function'; }
+  function inBackground() {
+    return !!document.hidden || (typeof document.hasFocus === 'function' && !document.hasFocus());
+  }
+  function pushNotify(title, body, tag, force) {
+    if (!notifySupported() || Notification.permission !== 'granted') return false;
+    if (!force && !inBackground()) return false;
+    try {
+      var n = new Notification(title, { body: body, tag: tag, lang: 'ru' });
+      n.onclick = function () {
+        try { window.focus(); } catch (e) { /* фокус не обязателен */ }
+        UI.show('best');
+        n.close();
+      };
+      return true;
+    } catch (e) {
+      // Например, Chrome на Android требует service worker — без него уведомление недоступно.
+      log('warn', 'Системное уведомление не показано: ' + e.message);
+      return false;
+    }
+  }
+  function notifyStatus(sig, text) {
+    if (!app.settings.notify || !app.settings.notifyStatus) return;
+    pushNotify(sig.coin + ' ' + sig.side + ': ' + text, 'Сигнал от ' + UI.fDT(sig.createdT) + ', вход ' + UI.fP(sig.entry) + ', SL ' + UI.fP(sig.sl) + '.', 'smc-st-' + sig.id, false);
+  }
+  app.notifyPermission = function () { return notifySupported() ? Notification.permission : 'unsupported'; };
+  app.requestNotify = function () {
+    return new Promise(function (resolve) {
+      if (!notifySupported()) { resolve('unsupported'); return; }
+      var done = false;
+      function fin(res) { if (!done) { done = true; resolve(res || Notification.permission); } }
+      try {
+        var p = Notification.requestPermission(fin);
+        if (p && typeof p.then === 'function') p.then(fin, function () { fin(Notification.permission); });
+      } catch (e) { fin(Notification.permission); }
+    });
+  };
+  app.testNotify = function () {
+    return pushNotify('SMC Signals: проверка уведомлений', 'Так будет выглядеть уведомление о новом сигнале. Нажмите, чтобы открыть приложение.', 'smc-test', true);
+  };
 
   // Сопровождение сигналов из прошлых сессий по пропущенным свечам.
   function replayOpen() {
@@ -169,10 +288,11 @@ var App = (function () {
     var chain = Promise.resolve();
     open.forEach(function (sig) {
       chain = chain.then(function () {
-        var S = app.series[sig.sym];
-        if (!S || !S.L || !S.L.c.length) return null;
-        var Lc = S.L.c, ms = S.L.ms;
-        var stopIdx = Math.max(0, Lc.length - C.live.catchUpBars) - 1; // дальше свечи обработает догрузка
+        var tf = sig.tf && sig.tf.ltf ? sig.tf.ltf : C.timeframes.ltf;
+        var S = app.series[sig.sym] && app.series[sig.sym][tf];
+        if (!S || !S.c.length) return null;
+        var Lc = S.c, ms = S.ms;
+        var stopIdx = Math.max(0, Lc.length - catchUpBars()) - 1; // дальше свечи обработает догрузка
         var firstT = Lc[0].t;
         var pre = Promise.resolve([]);
         if (sig.lastT + ms < firstT) {
@@ -183,7 +303,7 @@ var App = (function () {
             log('warn', sig.coin + ': ' + sig.note);
             return null;
           }
-          pre = Data.fetchRange(feed.adapter, feed.base, sig.sym, C.timeframes.ltf, sig.lastT + ms, firstT - ms).then(null, function (e) {
+          pre = Data.fetchRange(feed.adapter, feed.base, sig.sym, tf, sig.lastT + ms, firstT - ms).then(null, function (e) {
             log('warn', sig.coin + ': не удалось догрузить историю для сопровождения — ' + e.message);
             return [];
           });
@@ -201,23 +321,45 @@ var App = (function () {
     return chain;
   }
 
+  // Догрузка: прогон последних закрытых свечей (не меньше срока ожидания входа) по всем монетам —
+  // при старте, смене профиля или срока. Сопровождение идемпотентно (свечи до lastT пропускаются),
+  // дубли отсекает валидатор и id сигнала.
+  function catchUpSym(sym) {
+    var created = [], all = {};
+    activePresets().forEach(function (pid) { created = created.concat(processPreset(sym, pid, catchUpBars(), true)); });
+    Object.keys(app.series[sym] || {}).forEach(function (tf) { all[tf] = catchUpBars(); });
+    processLeftovers(sym, all, false);
+    return created;
+  }
+  function catchUpAll() {
+    var created = [];
+    Object.keys(app.series).forEach(function (sym) { created = created.concat(catchUpSym(sym)); });
+    created = dropFinishedLate(created);
+    updateOverviews();
+    Signals.Journal.save();
+    announce(created);
+    return created;
+  }
+
   // ---------- хуки ленты ----------
   var hooks = {
     getSettings: function () { return app.settings; },
-    onStatus: function (st) { UI.renderStatus(st); },
+    // План данных символа: монеты списка — все ТФ активных пресетов; остальные — только младшие ТФ их открытых сигналов.
+    getPlan: function (sym, full) {
+      var open = openLtfsOf(sym);
+      return full ? tfPlanFor(activePresets(), open) : tfPlanFor([], open.length ? open : [C.presets[primaryPreset()].ltf]);
+    },
+    onStatus: function (st) {
+      UI.renderStatus(st);
+      // Пока нет данных или связь потеряна — главный экран показывает состояние подключения.
+      if ((!app.ready || st.state === 'error') && UI.current() === 'best') UI.update('best');
+    },
     onLog: function (level, text) { log(level, text); },
     onReady: function () {
       buildAllSeries();
       replayOpen().then(function () {
-        var created = [];
-        Object.keys(app.series).forEach(function (sym) {
-          created = created.concat(processSymbol(sym, C.live.catchUpBars, true));
-        });
-        created = dropFinishedLate(created);
-        updateOverviews();
-        Signals.Journal.save();
+        catchUpAll();
         app.ready = true;
-        announce(created);
         UI.update();
       }).then(null, function (e) { log('error', 'Ошибка запуска: ' + e.message); });
     },
@@ -226,8 +368,13 @@ var App = (function () {
       buildAllSeries();
       var created = [];
       Object.keys(info.closedNew || {}).forEach(function (sym) {
-        var n = info.closedNew[sym];
-        if (n > 0) created = created.concat(processSymbol(sym, n, true));
+        var cn = info.closedNew[sym] || {};
+        if (cn._reload) { created = created.concat(catchUpSym(sym)); return; } // монета догружена — прогнать догрузку
+        activePresets().forEach(function (pid) {
+          var n = cn[C.presets[pid].ltf] || 0;
+          if (n > 0) created = created.concat(processPreset(sym, pid, n, true, true));
+        });
+        processLeftovers(sym, cn, true);
       });
       created = dropFinishedLate(created);
       updateOverviews();
@@ -240,24 +387,35 @@ var App = (function () {
   // ---------- данные для интерфейса ----------
   app.feedStatus = function () { return feed ? feed.status : { state: 'idle', notes: [] }; };
   app.activeCoins = function () { return feed ? feed.coins.slice() : []; };
+  // Самый мелкий загруженный ТФ символа — для текущей цены.
+  function finestTf(r) {
+    var best = null;
+    Object.keys(r.c || {}).forEach(function (tf) { if (!best || SMC.tfMs(tf) < SMC.tfMs(best)) best = tf; });
+    return best;
+  }
   app.priceOf = function (sym) {
     if (feed && feed.prices[sym] > 0) return feed.prices[sym];
-    var r = feed && feed.raw[sym];
-    if (r && r.formL) return r.formL.c;
-    if (r && r.L && r.L.length) return r.L[r.L.length - 1].c;
-    return NaN;
+    var r = feed && feed.raw[sym], tf = r ? finestTf(r) : null;
+    if (!tf) return NaN;
+    if (r.form[tf]) return r.form[tf].c;
+    var arr = r.c[tf];
+    return arr && arr.length ? arr[arr.length - 1].c : NaN;
   };
-  app.candlesFor = function (sym) {
+  // Свечи для мини-графика: младший ТФ сигнала (последние 120 + незакрытая).
+  app.candlesFor = function (sym, tf) {
     var r = feed && feed.raw[sym];
-    if (!r || !r.L) return [];
-    var arr = r.L.slice(-120);
-    if (r.formL) arr.push(r.formL);
+    if (!r || !r.c) return [];
+    tf = tf || C.presets[primaryPreset()].ltf;
+    var arr = (r.c[tf] || []).slice(-120);
+    if (r.form[tf]) arr.push(r.form[tf]);
     return arr;
   };
   app.provisionalOf = function (sig) {
-    var r = feed && feed.raw[sig.sym];
-    return r && r.formL ? Signals.provisional(sig, r.formL) : sig;
+    var r = feed && feed.raw[sig.sym], tf = sig.tf && sig.tf.ltf;
+    return r && r.form && tf && r.form[tf] ? Signals.provisional(sig, r.form[tf]) : sig;
   };
+  app.activePresets = function () { return activePresets(); };
+  app.primaryPreset = function () { return primaryPreset(); };
   app.openSignals = function () {
     return Signals.Journal.openFor(null).filter(function (s) { return Signals.isOpen(app.provisionalOf(s)); })
       .sort(function (a, b) { return (b.score - a.score) || ((b.roomR === Infinity ? 99 : b.roomR) - (a.roomR === Infinity ? 99 : a.roomR)); });
@@ -265,7 +423,7 @@ var App = (function () {
   app.bestSignal = function () { var l = app.openSignals(); return l.length ? l[0] : null; };
   app.coinRows = function () {
     if (!feed) return [];
-    var nowT = Data.now(), ms = SMC.tfMs(C.timeframes.ltf);
+    var nowT = Data.now(), ms = SMC.tfMs(C.presets[primaryPreset()].ltf);
     return feed.coins.map(function (c) {
       var ov = app.overview[c.sym], open = Signals.Journal.openFor(c.sym)[0];
       var row = { coin: c.coin, replaces: c.replaces, price: app.priceOf(c.sym), bias: ov ? ov.bias.dir : 0, status: '—', statusCls: 'muted', score: null };
@@ -310,7 +468,7 @@ var App = (function () {
     s.entry = rp(sig.entry); s.sl = rp(sig.sl); s.tp1 = rp(sig.tp1); s.tp2 = rp(sig.tp2); s.tp3 = rp(sig.tp3);
     s.feePct = sig.fee * 100;
     s.slipPct = sig.slip * 100;
-    var acc = Signals.Calib.accuracy(sig.coin, sig.score);
+    var acc = Signals.Calib.accuracy(sig.coin, sig.score, sig.mode, sig.preset);
     s.probPct = acc ? Math.round(acc.value * 1000) / 10 : NaN;
   };
   app.toCalc = function (id) { app.fillCalcFromSignal(id); UI.show('calc'); };
@@ -318,7 +476,7 @@ var App = (function () {
   // ---------- бэктест ----------
   function btDefaults() {
     return {
-      params: { coin: 'all', days: C.backtest.defaultDays, presetId: C.defaultPreset, minScore: app.settings.minScore, feePct: C.fees.futures, slipPct: app.settings.slipPct },
+      params: { coin: 'all', days: C.backtest.defaultDays, presetId: C.defaultPreset, minScore: app.settings.minScore, feePct: C.fees.futures, slipPct: app.settings.slipPct, mode: app.settings.strategy, expiryBars: app.settings.expiryBars },
       running: false, progress: { frac: 0, text: '' }, result: null, error: ''
     };
   }
@@ -326,17 +484,21 @@ var App = (function () {
     var bt = app.bt, p = bt.params;
     if (bt.running) return;
     if (!feed || !feed.adapter || !feed.coins.length) { UI.toast('Нет подключения к источнику данных', 'bad'); return; }
+    if (app.lc && app.lc.running) { UI.toast('Идёт проверка «Сигналов в день» — дождитесь её окончания', 'bad'); return; }
     if (!(p.minScore >= 60 && p.minScore <= 100)) p.minScore = app.settings.minScore;
     if (!(p.feePct >= 0)) p.feePct = marketFee();
     if (!(p.slipPct >= 0)) p.slipPct = app.settings.slipPct;
     var coins = p.coin === 'all' ? feed.coins.slice() : feed.coins.filter(function (c) { return c.coin === p.coin; });
     if (!coins.length) coins = feed.coins.slice();
+    if (!C.strategyModes[p.mode]) p.mode = app.settings.strategy;
+    if (C.lifecycle.expiryOptions.indexOf(p.expiryBars) < 0) p.expiryBars = app.settings.expiryBars;
     bt.running = true; bt.error = ''; bt.progress = { frac: 0, text: 'Старт…' };
     if (UI.current() === 'backtest') UI.update('backtest', true);
-    log('info', 'Бэктест: ' + C.presets[p.presetId].name + ', ' + p.days + ' дн, монет ' + coins.length + ', minScore ' + p.minScore);
+    log('info', 'Бэктест: ' + C.presets[p.presetId].name + ', профиль «' + C.strategyModes[p.mode].name + '», ' + p.days + ' дн, монет ' + coins.length + ', minScore ' + p.minScore + ', ожидание входа ' + p.expiryBars + ' свечей');
     Backtest.run({
       adapter: feed.adapter, base: feed.base, coins: coins, hasBtc: feed.hasBtc, days: p.days, presetId: p.presetId,
-      minScore: p.minScore, feePct: p.feePct, slipPct: p.slipPct, longOnly: app.settings.mode === 'long'
+      minScore: p.minScore, feePct: p.feePct, slipPct: p.slipPct, longOnly: app.settings.mode === 'long', mode: p.mode,
+      expiryBars: p.expiryBars
     }, function (pr) {
       bt.progress = pr;
       if (UI.current() === 'backtest') UI.updateBtProgress();
@@ -352,13 +514,93 @@ var App = (function () {
     });
   };
   app.cancelBacktest = function () { Backtest.cancel(); };
-  app.calibrate = function () {
+  // Калибровка точности: бэктест 60 дней по указанному пресету (по умолчанию — главный из активных).
+  app.calibrate = function (presetId) {
     var p = app.bt.params;
-    p.coin = 'all'; p.days = C.calibration.days; p.presetId = 'main'; p.minScore = app.settings.minScore;
-    p.feePct = marketFee(); p.slipPct = app.settings.slipPct;
+    p.coin = 'all'; p.days = C.calibration.days; p.presetId = C.presets[presetId] ? presetId : primaryPreset(); p.minScore = app.settings.minScore;
+    p.feePct = marketFee(); p.slipPct = app.settings.slipPct; p.mode = app.settings.strategy; p.expiryBars = app.settings.expiryBars;
     UI.show('backtest');
     app.runBacktest();
   };
+  // ---------- проверка текущих настроек live на истории: сколько сигналов в день ----------
+  // Бэктест каждого активного пресета на всех монетах списка (без записи в калибровку), затем объединение
+  // по правилам live (Backtest.mergeLive) и подсчёт по дням. Цифры на экране — только из этого расчёта.
+  function lcSnapshot() {
+    var s = app.settings;
+    return { strategy: s.strategy, livePreset: s.livePreset, expiryBars: s.expiryBars, minScore: s.minScore, mode: s.mode, coins: s.symbols.join(',') };
+  }
+  function lcDefaults() {
+    var saved = Store.get(C.storage.liveCheck, null);
+    var ok = saved && saved.v === 1 && Array.isArray(saved.days) && saved.snap && typeof saved.ts === 'number';
+    return { running: false, cancel: false, progress: { frac: 0, text: '' }, res: ok ? saved : null, error: '' };
+  }
+  function numOrNull(x) { return (typeof x === 'number' && isFinite(x)) ? x : null; }
+  // Настройки live изменились после последней проверки — её цифры относятся к другим настройкам.
+  app.liveCheckStale = function () {
+    var r = app.lc && app.lc.res, b = lcSnapshot();
+    return !!r && Object.keys(b).some(function (k) { return r.snap[k] !== b[k]; });
+  };
+  app.runLiveCheck = function () {
+    var lc = app.lc;
+    if (lc.running) return;
+    if (!feed || !feed.adapter || !feed.coins.length || !app.ready) { UI.toast('Данные ещё загружаются — запустите проверку чуть позже', 'bad'); return; }
+    if (app.bt.running || Backtest.isRunning()) { UI.toast('Идёт бэктест — дождитесь его окончания', 'bad'); return; }
+    var pids = activePresets(), coins = feed.coins.slice(), snap = lcSnapshot(), days = C.liveCheck.days;
+    var base = {
+      adapter: feed.adapter, base: feed.base, coins: coins, hasBtc: feed.hasBtc, days: days,
+      minScore: app.settings.minScore, feePct: marketFee(), slipPct: app.settings.slipPct,
+      longOnly: app.settings.mode === 'long', mode: app.settings.strategy, expiryBars: app.settings.expiryBars, readOnly: true
+    };
+    var results = [], k = 0;
+    lc.running = true; lc.cancel = false; lc.error = ''; lc.progress = { frac: 0, text: 'Старт…' };
+    UI.updateLiveCheck(true);
+    log('info', 'Проверка «Сигналов в день»: ' + days + ' дн, пресеты ' + pids.map(function (p) { return C.presets[p].short; }).join(' + ') +
+      ', профиль «' + C.strategyModes[snap.strategy].name + '», монет ' + coins.length + ', ожидание ' + snap.expiryBars + ' свечей, minScore ' + snap.minScore);
+    function next() {
+      if (lc.cancel) return Promise.reject(new Error('отменено'));
+      if (k >= pids.length) return Promise.resolve();
+      var P = C.presets[pids[k]];
+      return Backtest.run(Object.assign({}, base, { presetId: P.id }), function (pr) {
+        var f = pr.phase === 'load' ? 0.4 * (pr.frac || 0) : (pr.phase === 'sim' ? 0.4 + 0.6 * (pr.frac || 0) : 1);
+        lc.progress = { frac: (k + f) / pids.length, text: (pids.length > 1 ? (k + 1) + '/' + pids.length + ' · ' : '') + P.name + ' — ' + (pr.text || '') };
+        UI.updateLiveCheck(false);
+      }).then(function (res) { results.push(res); k++; return next(); });
+    }
+    next().then(function () {
+      // Общее окно всех пресетов; сигналы вне него не учитываются.
+      var fromT = Math.max.apply(null, results.map(function (r) { return r.meta.startT; }));
+      var toT = Math.min.apply(null, results.map(function (r) { return r.meta.endT; }));
+      var lists = results.map(function (r) { return r.signals.filter(function (s) { return s.createdT >= fromT && s.createdT < toT; }); });
+      var kept = Backtest.mergeLive(lists, pids, C.lifecycle.cooldownBars);
+      var sum = Backtest.liveSummary(kept, fromT, toT), st = sum.summary, o = sum.split.outS;
+      var warnings = [], covered = {};
+      results.forEach(function (r) {
+        (r.warnings || []).forEach(function (w) { if (warnings.indexOf(w) < 0) warnings.push(w); });
+        r.meta.coins.forEach(function (c) { covered[c] = true; });
+      });
+      lc.res = {
+        v: 1, ts: Date.now(), snap: snap, fromT: fromT, toT: toT, presets: pids, source: feed.adapter.name,
+        modes: pids.map(function (p) { return profileFor(snap.strategy, p); }), coins: Object.keys(covered).length,
+        days: sum.days, nDays: sum.nDays, avg: numOrNull(sum.avg), avgEntries: numOrNull(sum.avgEntries),
+        ge3: sum.ge3, zero: sum.zero, min: numOrNull(sum.min), max: numOrNull(sum.max),
+        signals: st.signals, entries: st.entries, n: st.n, wins: st.wins, losses: st.losses, winRate: numOrNull(st.winRate),
+        sumR: st.sumR, pf: numOrNull(st.pf), pfInf: st.pf === Infinity, compPct: st.compPct, maxDD: st.maxDD,
+        outN: o.n, outWins: o.wins, outSumR: o.sumR, warnings: warnings.slice(0, 10)
+      };
+      Store.set(C.storage.liveCheck, lc.res);
+      lc.running = false; lc.progress = { frac: 1, text: '' };
+      log('info', 'Проверка «Сигналов в день» завершена: в среднем ' + (lc.res.avg === null ? '—' : lc.res.avg.toFixed(1)) +
+        ' в день, 3 и больше — ' + sum.ge3 + ' из ' + sum.nDays + ' дней, сделок ' + st.n + ', итог ' + st.sumR.toFixed(2) + 'R');
+      UI.toast('Проверка на истории завершена', 'good');
+      UI.updateLiveCheck(true);
+    }).then(null, function (e) {
+      lc.running = false; lc.error = e.message || String(e); lc.progress = { frac: 0, text: '' };
+      log('warn', 'Проверка «Сигналов в день» остановлена: ' + lc.error);
+      UI.updateLiveCheck(true);
+    });
+  };
+  app.cancelLiveCheck = function () { if (app.lc.running) { app.lc.cancel = true; Backtest.cancel(); } };
+
   app.exportCSV = function () {
     var res = app.bt.result;
     if (!res) return;
@@ -377,13 +619,41 @@ var App = (function () {
 
   // ---------- настройки ----------
   app.updateSettings = function (patch, restart) {
-    var next = {};
+    var next = {}, prevStrategy = app.settings.strategy, prevExpiry = app.settings.expiryBars, prevLive = app.settings.livePreset;
     Object.keys(app.settings).forEach(function (k) { next[k] = app.settings[k]; });
     Object.keys(patch).forEach(function (k) { next[k] = patch[k]; });
     app.settings = sanitize(next);
     saveSettings();
-    if (restart) restartFeed();
-    else if (feed && app.ready) { updateOverviews(); }
+    if (app.settings.strategy !== prevStrategy) {
+      app.bt.params.mode = app.settings.strategy;
+      log('info', 'Профиль стратегии: ' + C.strategyModes[app.settings.strategy].name);
+    }
+    if (app.settings.expiryBars !== prevExpiry) {
+      app.bt.params.expiryBars = app.settings.expiryBars;
+      log('info', 'Ожидание входа: ' + app.settings.expiryBars + ' свечей младшего ТФ (для новых сигналов)');
+    }
+    if (app.settings.livePreset !== prevLive) {
+      // Другие таймфреймы — другой набор данных: перезапуск ленты и догрузка по новым пресетам.
+      log('info', 'Таймфреймы live: ' + (app.settings.livePreset === 'all' ? 'все пресеты сразу' : C.presets[app.settings.livePreset].name));
+      if (app.settings.livePreset !== 'all') app.bt.params.presetId = app.settings.livePreset;
+      restart = true;
+    }
+    if (restart) { restartFeed(); return; }
+    if (feed && app.ready) {
+      // Новый профиль или срок: сразу проверить последние закрытые свечи по новым правилам.
+      if (app.settings.strategy !== prevStrategy || app.settings.expiryBars !== prevExpiry) catchUpAll();
+      else updateOverviews();
+    }
+  };
+  // Режим «3+ сигнала в день»: частый профиль, все пресеты сразу, ожидание 96 свечей, minScore 60, 30 монет.
+  app.applyManySignals = function () {
+    var p = C.manySignalsPreset;
+    log('info', 'Включён режим «3+ сигнала в день»: профиль частый, все пресеты, 30 монет');
+    app.updateSettings({ strategy: p.strategy, livePreset: p.livePreset, expiryBars: p.expiryBars, minScore: p.minScore, symbols: C.extendedSymbols.slice() }, true);
+  };
+  app.isManySignals = function () {
+    var p = C.manySignalsPreset, s = app.settings;
+    return s.strategy === p.strategy && s.livePreset === p.livePreset && s.symbols.length >= C.extendedSymbols.length;
   };
   app.setCoins = function (text) {
     var list = String(text || '').toUpperCase().split(/[\s,;]+/).map(function (x) {
@@ -392,7 +662,7 @@ var App = (function () {
       return x;
     }).filter(function (x, k, arr) { return /^[A-Z0-9]{2,15}$/.test(x) && arr.indexOf(x) === k; });
     if (!list.length) { UI.toast('Список монет пуст', 'bad'); return; }
-    app.updateSettings({ symbols: list.slice(0, 20) }, true);
+    app.updateSettings({ symbols: list.slice(0, C.maxSymbols) }, true);
     UI.toast('Список монет применён', 'good');
   };
   function restartFeed() {
@@ -546,23 +816,76 @@ var App = (function () {
       var gross = 0.4 * 2 + 0.6 * (ex - 100), fees = 100 * 0.0005 + 0.4 * 102 * 0.0005 + 0.6 * ex * 0.0005;
       return s.outcome === 'be' && s.tpHit[0] && !s.tpHit[1] && Math.abs(s.resultR - (gross - fees) / 2) < 1e-9;
     });
-    test('Просрочка: нет входа за 12 свечей 15m', function () {
+    test('Просрочка: нет входа за 12 свечей 15m; срок из настройки (24 свечи) фиксируется в сигнале', function () {
       var s = sig(1), ok11 = false;
       for (var k = 1; k <= 12; k++) {
         Signals.step(s, { t: k * M15, o: 100.8, h: 101.2, l: 100.6, c: 100.9 }, C);
         if (k === 11) ok11 = s.status === 'pending';
       }
-      return ok11 && s.status === 'expired' && s.filledT === null;
+      var s24 = Signals.create(Object.assign({}, s, { T: M15, triggerT: 0, mode: 'strict' }), { fee: 0.0005, slip: 0.0003, ltfMs: M15, expiryBars: 24 });
+      var ok12 = true;
+      for (var q = 1; q <= 24; q++) {
+        Signals.step(s24, { t: q * M15, o: 100.8, h: 101.2, l: 100.6, c: 100.9 }, C);
+        if (q === 12 && s24.status !== 'pending') ok12 = false;
+      }
+      // Флаг отмены по TP3: включён — цена дошла до TP3 без входа, сигнал отменяется (касание входа в той же
+      // свече важнее); выключен (по умолчанию) — сигнал продолжает ждать вход.
+      var onCfg = { tp: C.tp, lifecycle: { expiryBars: 12, cancelIfTp1BeforeEntry: false, cancelIfTp3BeforeEntry: true } };
+      var candle3 = { t: M15, o: 100.6, h: 108.5, l: 100.5, c: 108 };
+      var t3 = sig(1), t3b = sig(1), t3off = sig(1);
+      Signals.step(t3, candle3, onCfg);
+      Signals.step(t3b, { t: M15, o: 101, h: 108.5, l: 99.9, c: 108 }, onCfg);
+      Signals.step(t3off, candle3, C);
+      return ok11 && s.status === 'expired' && s.filledT === null && s.expiryBars === 12 &&
+        ok12 && s24.status === 'expired' && s24.expiryBars === 24 && s24.expiresT === M15 + 24 * M15 &&
+        t3.status === 'expired' && t3.outcome === 'target' && t3.filledT === null && t3b.status === 'active' &&
+        C.lifecycle.cancelIfTp3BeforeEntry === false && t3off.status === 'pending';
     });
-    test('Калькулятор: 100 USDT, риск 1%, вход 100, SL 98, плечо 5x → 0.5 монеты, 50 USDT, маржа 10, убыток на SL 1 USDT', function () {
+    test('Калькулятор: 100 USDT, риск 1%, вход 100, SL 98, 5x → 0.5 монеты, 50 USDT, маржа 10, убыток на SL 1 USDT; ликвидация и неверный SL', function () {
       var r = Calc.compute({ deposit: 100, riskPct: 1, dir: 1, entry: 100, sl: 98, tp: [102, 104, 108], fr: [40, 30, 30], leverage: 5, feePct: 0, slipPct: 0, minOrder: 5, mode: 'risk', mmrPct: 0.5 });
-      return r.ok && Math.abs(r.qty - 0.5) < 1e-12 && Math.abs(r.notional - 50) < 1e-9 && Math.abs(r.margin - 10) < 1e-9 && Math.abs(r.scenarios.sl.usd + 1) < 1e-9 && Math.abs(r.scenarios.all.usd - (0.5 * (0.4 * 2 + 0.3 * 4 + 0.3 * 8))) < 1e-9;
-    });
-    test('Калькулятор: ликвидация LONG ниже входа, SHORT выше; SL не с той стороны — ошибка', function () {
-      var l = Calc.compute({ deposit: 100, riskPct: 1, dir: 1, entry: 100, sl: 98, tp: [102, 104, 108], leverage: 5, feePct: 0.05, slipPct: 0, mode: 'risk', mmrPct: 0.5 });
+      var ok = r.ok && Math.abs(r.qty - 0.5) < 1e-12 && Math.abs(r.notional - 50) < 1e-9 && Math.abs(r.margin - 10) < 1e-9 && Math.abs(r.scenarios.sl.usd + 1) < 1e-9 && Math.abs(r.scenarios.all.usd - (0.5 * (0.4 * 2 + 0.3 * 4 + 0.3 * 8))) < 1e-9;
       var s = Calc.compute({ deposit: 100, riskPct: 1, dir: -1, entry: 100, sl: 102, tp: [98, 96, 92], leverage: 5, feePct: 0.05, slipPct: 0, mode: 'risk', mmrPct: 0.5 });
       var w = Calc.compute({ deposit: 100, riskPct: 1, dir: 1, entry: 100, sl: 101, tp: [102, 104, 108], leverage: 5, mode: 'risk' });
-      return l.liq > 0 && l.liq < 98 && Math.abs(l.liq - 100 * 0.8 / 0.995) < 1e-9 && s.liq > 102 && !w.ok;
+      return ok && r.liq > 0 && r.liq < 98 && Math.abs(r.liq - 100 * 0.8 / 0.995) < 1e-9 && s.liq > 102 && !w.ok;
+    });
+    test('Профили стратегии, план данных и объединение пресетов live', function () {
+      var soft = configFor('soft'), strict = configFor('strict');
+      var profiles = soft.require.sweep === false && soft.pdRange === 'mtf' && soft.entryMode === 'edge' && soft.strategy === 'soft' &&
+        strict.require.sweep === true && strict.pdRange === 'htf' && strict.entryMode === 'mid' &&
+        CONFIG.require.sweep === true && soft.sl.minRiskPct === CONFIG.sl.minRiskPct && soft.tp.tp3MinR === CONFIG.tp.tp3MinR &&
+        soft.poi.maxDistAtr === CONFIG.poi.maxDistAtr && Object.isFrozen(soft.require) && configFor('nope').strategy === 'strict';
+      // Частый: зона необязательна и дальше, импульс слабее, место от 2.5R; риск и тренд — как в CONFIG.
+      var fr = configFor('frequent');
+      profiles = profiles && fr.poi.optional === true && fr.poi.maxDistAtr === 1 && fr.displacement.single === 1.2 &&
+        fr.displacement.double === 1.6 && fr.tp.tp3MinR === 2.5 && fr.tp.tp3MaxR === CONFIG.tp.tp3MaxR &&
+        fr.require.sweep === false && fr.sl.minRiskPct === CONFIG.sl.minRiskPct && CONFIG.poi.optional === false &&
+        Signals.modeOf({ mode: 'frequent' }) === 'frequent' && Signals.modeOf({ mode: 'x' }) === 'strict' &&
+        profileFor('frequent', 'scalp') === 'soft' && profileFor('frequent', 'main') === 'frequent' &&
+        profileFor('frequent', 'swing') === 'frequent' && profileFor('soft', 'scalp') === 'soft' && profileFor('strict', 'scalp') === 'strict';
+      // «Все сразу»: 5 таймфреймов; младшие — 5m, 15m, 1h; 15m держит 30 дней (средний ТФ скальпа).
+      var all = tfPlanFor(['main', 'swing', 'scalp']), main = tfPlanFor(['main']);
+      var keys = Object.keys(all).sort().join(',');
+      var plan = keys === '15m,1d,1h,4h,5m' && all['5m'].ltf && all['15m'].ltf && all['1h'].ltf && !all['4h'].ltf && !all['1d'].ltf &&
+        all['15m'].count >= 30 * 96 && all['1h'].count >= 30 * 24 && all['1d'].count >= CONFIG.windows.htf &&
+        Object.keys(main).sort().join(',') === '15m,1h,4h' && main['15m'].ltf && !main['1h'].ltf &&
+        tfPlanFor([], ['5m'])['5m'].ltf === true;
+      // Проверка «Сигналов в день»: по монете один открытый сигнал (при равном времени — основной пресет),
+      // общая пауза 8 свечей после SL; по дням считаются только полные сутки.
+      var D = 86400000, b0 = new Date(2026, 0, 5).getTime();
+      function ms(coin, pid, c, cl, out, filled) {
+        return { sym: coin, coin: coin, preset: pid, createdT: b0 + c * H1, closedT: cl === null ? null : b0 + cl * H1, outcome: out || null, filledT: filled ? b0 + c * H1 : null, ltfMs: M15 };
+      }
+      var kept = Backtest.mergeLive([
+        [ms('A', 'main', 1, 5, 'tp1', true), ms('A', 'main', 6.5, 8), ms('B', 'main', 2, 4)],
+        [ms('A', 'swing', 3, 9), ms('A', 'swing', 30, 31)],
+        [ms('A', 'scalp', 5, 6, 'sl', true), ms('B', 'scalp', 2, null)]
+      ], ['main', 'swing', 'scalp'], 8);
+      var ids = kept.map(function (s) { return s.coin + s.preset + (s.createdT - b0) / H1; }).join(',');
+      var days = Backtest.countByDay(kept, b0 - 1, b0 + 2 * D), part = Backtest.countByDay(kept, b0 + H1 / 2, b0 + 2 * D);
+      var sm = Backtest.liveSummary(kept, b0, b0 + 2 * D);
+      var merge = ids === 'Amain1,Bmain2,Ascalp5,Aswing30' && days.length === 2 && days[0].n === 3 && days[0].e === 2 && days[1].n === 1 &&
+        part.length === 1 && part[0].n === 1 && sm.ge3 === 1 && sm.zero === 0 && sm.avg === 2 && sm.min === 1 && sm.max === 3;
+      return profiles && plan && merge;
     });
     test('Сглаживание точности: (успехи + 10p) / (n + 10)', function () {
       return Math.abs(Signals.smooth(10, 20, 0.5, 10) - 0.5) < 1e-12 && Math.abs(Signals.smooth(18, 20, 0.5, 10) - 23 / 30) < 1e-12 &&
@@ -592,6 +915,7 @@ var App = (function () {
     Signals.Calib.load();
     app.calc = calcDefaults();
     app.bt = btDefaults();
+    app.lc = lcDefaults();
     UI.init(app);
     app.selfTest = runSelfTests();
     if (!app.selfTest.ok) log('error', 'Самопроверка не пройдена: ' + app.selfTest.failed.join('; '));
