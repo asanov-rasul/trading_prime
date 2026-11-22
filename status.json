@@ -1,6 +1,6 @@
 {
- "ts": 1795342146261,
- "time": "2026-11-22T10:09:06.261Z",
+ "ts": 1795369885780,
+ "time": "2026-11-22T17:51:25.780Z",
  "version": "1.6.1",
  "telegram": "on",
  "profile": "soft",
@@ -34,5 +34,5 @@
  "guard": false,
  "errors": [],
  "requests": 119,
- "durationMs": 6192
+ "durationMs": 4745
 }
