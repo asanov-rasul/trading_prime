@@ -4,6 +4,10 @@
  "chatReady": true,
  "signals": [],
  "seen": {},
- "summaryWeek": null,
- "source": "binanceSpot"
+ "summaryWeek": "2026-11-23",
+ "source": "binanceSpot",
+ "outage": null,
+ "guard": {
+  "active": false
+ }
 }
