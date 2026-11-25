@@ -1,6 +1,6 @@
 {
- "ts": 1795618684373,
- "time": "2026-11-25T14:58:04.373Z",
+ "ts": 1795649643161,
+ "time": "2026-11-25T23:34:03.161Z",
  "version": "1.6.1",
  "telegram": "on",
  "profile": "soft",
@@ -14,11 +14,9 @@
   "id": "binanceSpot",
   "name": "Binance Spot",
   "market": "spot",
-  "host": "data-api.binance.vision"
+  "host": "api.binance.com"
  },
- "sourceFails": [
-  "Binance Spot · api.binance.com: HTTP 451: {\n  \"code\": 0,\n  \"msg\": \"Service unavailable from a restricted location according to 'b. Eligibility' in https://www.bin…"
- ],
+ "sourceFails": [],
  "coins": {
   "want": 29,
   "loaded": 29,
@@ -33,6 +31,6 @@
  "outageSince": null,
  "guard": false,
  "errors": [],
- "requests": 119,
- "durationMs": 4541
+ "requests": 118,
+ "durationMs": 6224
 }
